@@ -133,7 +133,11 @@ pub async fn handle(
                             globalThis.__obscura_click_target = target;\
                             globalThis.__obscura_mouse_down = {{target:target,button:{button_code},clickCount:{click_count}}};\
                             var evt = globalThis.__obscura_markTrusted(new MouseEvent('mousedown', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
-                            target.dispatchEvent(evt);\
+                            var notCancelled = target.dispatchEvent(evt);\
+                            if (notCancelled) {{\
+                                var focusable = globalThis.__obscura_focusableTarget(target);\
+                                if (focusable && focusable !== document.activeElement) focusable.focus();\
+                            }}\
                         }})()",
                         x = x,
                         y = y,

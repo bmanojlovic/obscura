@@ -2809,6 +2809,29 @@ function _isActuallyDisabled(el) {
   return false;
 }
 
+// The HTML spec's "focusing steps" for a click/mousedown's default action:
+// find the nearest ancestor (starting at the event target) that is a
+// focusable area, per the areas-focusable-by-default list -- this is not the
+// sequential-focus-navigation set, so a tabindex="-1" host still qualifies,
+// but a disabled form control never does.
+const _AUTOFOCUSABLE = 'input:not([type=hidden]),textarea,select,button,iframe';
+function _isNormallyFocusable(el) {
+  if (!el || el.nodeType !== 1) return false;
+  if (_isActuallyDisabled(el)) return false;
+  if (el.matches && el.matches(_AUTOFOCUSABLE)) return true;
+  if ((el.tagName === 'A' || el.tagName === 'AREA') && el.hasAttribute('href')) return true;
+  if (el.isContentEditable) return true;
+  if (el.hasAttribute('tabindex') && !Number.isNaN(parseInt(el.getAttribute('tabindex'), 10))) return true;
+  return false;
+}
+function _focusableAncestor(el) {
+  while (el && el.nodeType === 1) {
+    if (_isNormallyFocusable(el)) return el;
+    el = el.parentElement;
+  }
+  return null;
+}
+
 globalThis.__obscura_activateLabel = function(label, control, trusted) {
   if (!label || !control || _forwardingLabels.has(label)) return false;
   if (_isActuallyDisabled(control) || typeof control.click !== 'function') return false;
@@ -2824,10 +2847,12 @@ globalThis.__obscura_labeledControl = function(label) { return _labeledControl(l
 globalThis.__obscura_interactiveHost = function(el) {
   return el && el.closest ? el.closest(_INTERACTIVE) : null;
 };
+globalThis.__obscura_focusableTarget = function(el) { return _focusableAncestor(el); };
 // Frozen so page script can neither replace the helpers to suppress or fake
 // label activation, nor delete them and make later clicks throw.
 for (const _name of ['__obscura_activateLabel', '__obscura_isDisabled',
-                     '__obscura_labeledControl', '__obscura_interactiveHost']) {
+                     '__obscura_labeledControl', '__obscura_interactiveHost',
+                     '__obscura_focusableTarget']) {
   Object.defineProperty(globalThis, _name, { writable: false, configurable: false });
 }
 
