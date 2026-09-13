@@ -9847,12 +9847,13 @@ globalThis.__obscura_setFieldValue = function(el, field, value) {
   el[field] = value;
 };
 
-// Build a FileList-like object: an array with the DOM's `item(i)` accessor.
-function _makeFileList(files) {
-  const list = files.slice();
-  Object.defineProperty(list, "item", { value: (i) => list[i] || null, enumerable: false });
-  return list;
-}
+// Build a FileList: an array-like with the DOM's `item(i)` accessor and a real
+// FileList prototype, so `instanceof FileList` and bare references to the
+// global both work (issue: FileList was never assigned to globalThis, so any
+// page that referenced the identifier directly -- e.g. `value instanceof
+// FileList` in a form/upload component -- threw ReferenceError and aborted
+// module evaluation before the app could mount).
+function _makeFileList(files) { return FileList.from(files); }
 function _emptyFileList() { return _makeFileList([]); }
 
 // Populate an <input type=file>'s FileList from the CDP DOM.setFileInputFiles
@@ -10218,6 +10219,10 @@ if (typeof File === "undefined") globalThis.File = class File extends Blob {
     this.lastModified = opts.lastModified != null ? Number(opts.lastModified) : Date.now();
   }
   get [Symbol.toStringTag]() { return "File"; }
+};
+if (typeof FileList === "undefined") globalThis.FileList = class FileList extends Array {
+  item(i) { return this[i] ?? null; }
+  get [Symbol.toStringTag]() { return "FileList"; }
 };
 // A FormData value keeps Blob/File objects as-is (the multipart serializer reads
 // their bytes); every other value is coerced to a string per the Fetch spec.
