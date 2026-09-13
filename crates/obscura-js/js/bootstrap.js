@@ -6580,6 +6580,16 @@ Object.defineProperty(globalThis, 'location', {
   enumerable: true,
 });
 
+// `origin` is a real bare global (window.origin), not just location.origin --
+// code that references the identifier directly (e.g. Quasar's boot sequence)
+// throws ReferenceError if it's missing entirely, same failure mode as the
+// missing FileList global. Tracks the current page like location.origin does,
+// via a getter rather than a snapshot taken once at bootstrap time.
+Object.defineProperty(globalThis, 'origin', {
+  get() { return globalThis.location.origin; },
+  configurable: false,
+  enumerable: true,
+});
 globalThis.window = globalThis;
 globalThis.self = globalThis;
 globalThis.top = globalThis;
