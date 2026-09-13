@@ -188,6 +188,11 @@ pub async fn handle(
                 }
             } else if event_type == "mousePressed" {
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
+                    // The click's default action focuses the nearest focusable
+                    // area per the spec's focusing steps, falling back to the
+                    // interactive-content host for the elements the
+                    // focusable-area set omits (audio/video[controls], embed,
+                    // details); with neither, focus returns to the body.
                     let code = format!(
                         "(function() {{\
                             var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
@@ -220,9 +225,12 @@ pub async fn handle(
                             var evt = globalThis.__obscura_markTrusted(new MouseEvent('mousedown', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                             target.dispatchEvent(evt);\
                             if (!evt.defaultPrevented) {{\
-                                var focusTarget = globalThis.__obscura_interactiveHost(target) || (target.closest && target.closest('[tabindex]'));\
-                                if (focusTarget && !globalThis.__obscura_isDisabled(focusTarget)) focusTarget.focus();\
-                                else if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();\
+                                var focusTarget = globalThis.__obscura_focusableTarget(target) || globalThis.__obscura_interactiveHost(target);\
+                                if (focusTarget && !globalThis.__obscura_isDisabled(focusTarget)) {{\
+                                    if (focusTarget !== document.activeElement) focusTarget.focus();\
+                                }} else if (document.activeElement && document.activeElement !== document.body) {{\
+                                    document.activeElement.blur();\
+                                }}\
                             }}\
                         }})()",
                         x = x,
