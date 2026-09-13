@@ -11991,6 +11991,18 @@ function _ensureWindowNamedProperty(name) {
   try {
     Object.defineProperty(globalThis, name, {
       get() { return _windowNamedValue(name); },
+      // A real WindowProxy's named-access accessor has no setter either, but
+      // `window.foo = x` still succeeds and shadows an element named "foo"
+      // with a real own property instead of throwing -- page scripts rely on
+      // this (e.g. Next.js hydration assigning `self.__NEXT_DATA__ = {...}`
+      // over a `<script id="__NEXT_DATA__">` tag). Without a setter here,
+      // plain assignment to this getter-only accessor throws in strict mode.
+      set(value) {
+        _windowNamedPropertyNames.delete(name);
+        Object.defineProperty(globalThis, name, {
+          value, writable: true, configurable: true, enumerable: true,
+        });
+      },
       configurable: true,
       enumerable: true,
     });
