@@ -100,6 +100,7 @@ pub use paint::{
     image_intrinsic_dimensions, paint_dom, paint_dom_scrolled,
     paint_dom_scrolled_at_animation_time,
     paint_dom_scrolled_at_animation_time_with_surface_color_and_resources,
+    paint_dom_scrolled_at_animation_time_with_surface_color_and_resources_and_canvas_surfaces,
     paint_dom_scrolled_at_animation_time_with_surface_color, paint_prepared,
     paint_prepared_region_with_scroll, paint_prepared_region_with_scroll_and_surface_color,
     paint_prepared_region_with_scroll_and_surface_color_and_canvas_surfaces,

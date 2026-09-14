@@ -28,19 +28,30 @@ use crate::ops::{
     begin_animation_task, clamp_scroll_offset, document_base_url, ensure_resolved_scroll,
 };
 
+/// Paint-time replaced-content lookup covering both live `<canvas>` backing
+/// stores and pre-rendered `<iframe>` documents (see `refresh_iframe_surfaces`);
+/// node ids never collide between the two since they name different elements.
 #[cfg(feature = "render")]
 struct RuntimeCanvasSurfaceSource<'a>(
     &'a HashMap<NodeId, crate::ops::CanvasBackingSurface>,
+    &'a HashMap<NodeId, crate::ops::IframeBackingSurface>,
 );
 
 #[cfg(feature = "render")]
 impl obscura_render::CanvasSurfaceSource for RuntimeCanvasSurfaceSource<'_> {
     fn surface(&self, node: NodeId) -> Option<obscura_render::CanvasSurface<'_>> {
-        let surface = self.0.get(&node)?;
+        if let Some(surface) = self.0.get(&node) {
+            return obscura_render::CanvasSurface::from_rgba8(
+                surface.width,
+                surface.height,
+                surface.pixels.as_ref(),
+            );
+        }
+        let surface = self.1.get(&node)?;
         obscura_render::CanvasSurface::from_rgba8(
             surface.width,
             surface.height,
-            surface.pixels.as_ref(),
+            surface.pixels.as_slice(),
         )
     }
 }
@@ -1154,6 +1165,8 @@ impl ObscuraJsRuntime {
             gs.stylesheet_cache = obscura_render::StylesheetCache::default();
             gs.dynamic_fonts.clear();
             gs.canvas_surfaces.clear();
+            gs.frame_elements.clear();
+            gs.iframe_surfaces.clear();
             gs.scroll_offset = (0.0, 0.0);
             gs.element_scroll_offsets.clear();
             gs.scroll_generation = 0;
@@ -1562,6 +1575,106 @@ impl ObscuraJsRuntime {
         )
     }
 
+    /// Pre-render every `<iframe>` this document hosts into
+    /// `state.iframe_surfaces`, keyed by the iframe element's node id, so the
+    /// paint pass composites it as replaced content the same way a live
+    /// `<canvas>` backing store is (`RuntimeCanvasSurfaceSource`).
+    ///
+    /// Without this, `paint_dom` only ever sees one `DomTree` — a frame's
+    /// document is fetched and given its own realm (frame.rs), but nothing
+    /// ever paints it, same-origin or not, so an iframe's box stayed
+    /// permanently blank in every capture (an Akamai/reCAPTCHA challenge
+    /// iframe, for instance, never rendered at all).
+    ///
+    /// Must run after `ensure_resolved_scroll` has built `state.prepared_render`
+    /// for the current viewport: an iframe's content-box size, which is what it
+    /// gets rendered at, comes from that layout. Recurses depth-first (capped)
+    /// so a frame nested inside another frame has its own surface ready before
+    /// its host is painted.
+    #[cfg(feature = "render")]
+    fn refresh_iframe_surfaces(&self, state: &mut ObscuraState) {
+        self.refresh_iframe_surfaces_at_depth(state, 0);
+    }
+
+    #[cfg(feature = "render")]
+    fn refresh_iframe_surfaces_at_depth(&self, state: &mut ObscuraState, depth: u32) {
+        // A page nesting frames this deep is not a real layout; it is either a
+        // malicious/broken page or a frame that (indirectly) embeds itself.
+        // Bail rather than recurse without bound.
+        const MAX_FRAME_DEPTH: u32 = 8;
+        state.iframe_surfaces.clear();
+        if state.frame_elements.is_empty() || depth >= MAX_FRAME_DEPTH {
+            return;
+        }
+        let Some(prepared) = state.prepared_render.as_ref() else {
+            return;
+        };
+        let targets: Vec<(NodeId, u32)> = state
+            .frame_elements
+            .iter()
+            .map(|(&nid, &frame_id)| (nid, frame_id))
+            .collect();
+        let realm_states = self.realm_states();
+        for (nid, frame_id) in targets {
+            // The client (padding) box: an iframe carries no author padding in
+            // practice, so this is the content box a real browser would fill.
+            let Some((width, height)) = prepared.client_size(nid) else {
+                continue;
+            };
+            if width < 1.0 || height < 1.0 {
+                continue;
+            }
+            let Some(child_shared) = realm_states.borrow().by_frame_id(frame_id) else {
+                // No live realm for this frame id (never bound, or torn down
+                // since) -- leave the box blank, same as before this fix.
+                continue;
+            };
+            let mut child = child_shared.borrow_mut();
+            self.refresh_iframe_surfaces_at_depth(&mut child, depth + 1);
+            let base_url = document_base_url(&child);
+            let ObscuraState {
+                dom,
+                render_resources,
+                canvas_surfaces,
+                iframe_surfaces,
+                ..
+            } = &mut *child;
+            let Some(dom) = dom.as_ref() else {
+                continue;
+            };
+            let child_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces, iframe_surfaces);
+            // Always a fresh, unretained render: a frame realm has no
+            // equivalent of the host's per-capture `ensure_resolved_scroll`
+            // cache-reuse path, and correctness matters far more here than
+            // repaint cost for what is, in practice, a handful of frames.
+            // Renders at the frame's own top-left scroll position (0, 0) —
+            // matching a freshly loaded widget/challenge iframe, the common
+            // case this fixes; reflecting the frame's own live scroll offset
+            // is a follow-up, not required for this fix.
+            let Some(pixmap) = obscura_render::paint_dom_scrolled_at_animation_time_with_surface_color_and_resources_and_canvas_surfaces(
+                dom,
+                (width, height),
+                base_url.as_deref(),
+                (0.0, 0.0),
+                obscura_render::AnimationSampleTime::default(),
+                [255, 255, 255, 255],
+                render_resources,
+                &child_surfaces,
+            ) else {
+                continue;
+            };
+            let (surface_width, surface_height) = (pixmap.width(), pixmap.height());
+            state.iframe_surfaces.insert(
+                nid,
+                crate::ops::IframeBackingSurface {
+                    width: surface_width,
+                    height: surface_height,
+                    pixels: pixmap.take(),
+                },
+            );
+        }
+    }
+
     /// Paint an unprepared view of the current document against the runtime's
     /// retained resource cache.
     ///
@@ -1611,16 +1724,18 @@ impl ObscuraJsRuntime {
         }
         with_sync_render_loading_disabled(&mut state, |state| {
             ensure_resolved_scroll(state)?;
+            self.refresh_iframe_surfaces(state);
             let ObscuraState {
                 dom,
                 prepared_render,
                 render_resources,
                 resolved_scroll,
                 canvas_surfaces,
+                iframe_surfaces,
                 ..
             } = state;
             let (_, scroll) = resolved_scroll.as_ref()?;
-            let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces);
+            let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces, iframe_surfaces);
             obscura_render::screenshot_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
                 dom.as_ref()?,
                 prepared_render.as_mut()?,
@@ -1652,18 +1767,20 @@ impl ObscuraJsRuntime {
         let mut state = self.state.borrow_mut();
         with_sync_render_loading_disabled(&mut state, |state| {
             ensure_resolved_scroll(state).ok_or(obscura_render::CaptureError::PaintFailed)?;
+            self.refresh_iframe_surfaces(state);
             let ObscuraState {
                 dom,
                 prepared_render,
                 render_resources,
                 resolved_scroll,
                 canvas_surfaces,
+                iframe_surfaces,
                 ..
             } = state;
             let (_, scroll) = resolved_scroll
                 .as_ref()
                 .ok_or(obscura_render::CaptureError::PaintFailed)?;
-            let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces);
+            let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces, iframe_surfaces);
             obscura_render::screenshot_prepared_region_with_scroll_and_surface_color_and_canvas_surfaces(
                 dom.as_ref()
                     .ok_or(obscura_render::CaptureError::PaintFailed)?,
@@ -1690,18 +1807,20 @@ impl ObscuraJsRuntime {
         let mut state = self.state.borrow_mut();
         with_sync_render_loading_disabled(&mut state, |state| {
             ensure_resolved_scroll(state).ok_or(obscura_render::CaptureError::PaintFailed)?;
+            self.refresh_iframe_surfaces(state);
             let ObscuraState {
                 dom,
                 prepared_render,
                 render_resources,
                 resolved_scroll,
                 canvas_surfaces,
+                iframe_surfaces,
                 ..
             } = state;
             let (_, scroll) = resolved_scroll
                 .as_ref()
                 .ok_or(obscura_render::CaptureError::PaintFailed)?;
-            let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces);
+            let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces, iframe_surfaces);
             obscura_render::screenshot_prepared_region_with_scroll_and_backgrounds_and_canvas_surfaces(
                 dom.as_ref()
                     .ok_or(obscura_render::CaptureError::PaintFailed)?,
@@ -1731,12 +1850,14 @@ impl ObscuraJsRuntime {
         let mut state = self.state.borrow_mut();
         with_sync_render_loading_disabled(&mut state, |state| {
             ensure_resolved_scroll(state).ok_or(obscura_render::CaptureError::PaintFailed)?;
+            self.refresh_iframe_surfaces(state);
             let ObscuraState {
                 dom,
                 prepared_render,
                 render_resources,
                 element_scroll_offsets,
                 canvas_surfaces,
+                iframe_surfaces,
                 ..
             } = state;
             let dom = dom
@@ -1751,7 +1872,7 @@ impl ObscuraJsRuntime {
                     element_scroll_offsets,
                     (region.width, region.height),
                 );
-            let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces);
+            let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces, iframe_surfaces);
             obscura_render::screenshot_prepared_region_with_scroll_and_backgrounds_and_canvas_surfaces(
                 dom,
                 prepared_render
@@ -13612,10 +13733,11 @@ mod tests {
                 render_resources,
                 resolved_scroll,
                 canvas_surfaces,
+                iframe_surfaces,
                 ..
             } = &mut *state;
             let (_, scroll) = resolved_scroll.as_ref().expect("scroll snapshot");
-            let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces);
+            let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces, iframe_surfaces);
             obscura_render::paint_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
                 dom.as_ref().expect("canvas DOM"),
                 prepared_render.as_mut().expect("prepared canvas layout"),
