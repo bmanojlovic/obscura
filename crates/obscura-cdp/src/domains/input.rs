@@ -435,11 +435,20 @@ pub async fn handle(
             if let Some(page) = ctx.get_session_page_mut(session_id) {
                 match event_type {
                     "keyDown" | "rawKeyDown" => {
+                        // Tab's default action (move focus) belongs in the same
+                        // round trip as the keydown dispatch, gated on the event
+                        // actually not being cancelled -- a page that traps Tab
+                        // itself (a modal dialog's focus trap, a custom widget)
+                        // calls preventDefault(), and real Chrome then leaves
+                        // focus untouched, same as it does for any other
+                        // cancelled default action.
                         let js = format!(
                             "(function() {{\
                                 var target = document.activeElement || document.body;\
                                 var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:{key},code:{code},keyCode:{virtual_key_code},which:{virtual_key_code},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
-                                return target.dispatchEvent(evt);\
+                                var notCancelled = target.dispatchEvent(evt);\
+                                if (notCancelled && {is_tab}) {{ globalThis.__obscura_moveSequentialFocus({forward}); }}\
+                                return notCancelled;\
                             }})()",
                             // Escape backslash BEFORE single-quote (as the text
                             // path below does) so a key like "\" — Chrome's
@@ -448,6 +457,8 @@ pub async fn handle(
                             key = js_str(key),
                             code = js_str(code),
                             virtual_key_code = virtual_key_code,
+                            is_tab = key == "Tab",
+                            forward = !shift_key,
                         );
                         if page.evaluate(&js).as_bool() == Some(false) {
                             return Ok(json!({}));
