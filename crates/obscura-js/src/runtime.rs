@@ -18332,6 +18332,40 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "render")]
+    fn test_element_from_point_prefers_reparented_child_over_new_wrapper() {
+        // A framework re-render can create a new wrapper element and reparent
+        // an already-live child into it (e.g. React wrapping an existing
+        // <input> in a new <form>). The wrapper's _nid is then HIGHER than
+        // its own child's, since nid reflects creation order, not tree
+        // depth. Hit-testing must still resolve to the deeper element (the
+        // child) via actual DOM depth, not to whichever sibling/ancestor
+        // happens to have the highest _nid.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let tag = rt
+            .evaluate(
+                "(function() {\
+                    var input = document.createElement('input');\
+                    input.id = 'target-input';\
+                    document.body.appendChild(input);\
+                    var wrapper = document.createElement('form');\
+                    wrapper.style.position = 'absolute';\
+                    wrapper.style.left = '0px';\
+                    wrapper.style.top = '0px';\
+                    wrapper.style.width = '100px';\
+                    wrapper.style.height = '20px';\
+                    document.body.appendChild(wrapper);\
+                    input.style.width = '100px';\
+                    input.style.height = '20px';\
+                    wrapper.appendChild(input);\
+                    return document.elementFromPoint(10, 10).tagName;\
+                })()",
+            )
+            .unwrap();
+        assert_eq!(tag, serde_json::json!("INPUT"));
+    }
+
+    #[test]
     fn test_element_from_point_non_numeric_returns_null() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let nan = rt.evaluate("document.elementFromPoint(NaN, 10)").unwrap();

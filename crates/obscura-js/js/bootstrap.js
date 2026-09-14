@@ -15245,8 +15245,13 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
   // don't form a proper containment hierarchy (a child's rect can lie far
   // outside its parent's), so a tree walk that only descends into ancestors
   // containing (x,y) would never reach a deep <input> inside <label><p>.
-  // Returns the deepest matching element (highest nid wins as a proxy for
-  // tree depth) so descendants beat ancestors.
+  // Returns the deepest matching element by actual ancestor-chain depth, so
+  // descendants beat ancestors. This must be live tree depth, not creation
+  // order (_nid): a framework re-render can create a new wrapper element and
+  // reparent an existing child into it (e.g. React wrapping an already-live
+  // <input> in a new <form>), which gives the wrapper a HIGHER nid than its
+  // own child -- "highest nid wins" then picks the ancestor over the
+  // descendant it just adopted.
   Document.prototype.elementFromPoint = function(x, y) {
     if (typeof x !== 'number' || typeof y !== 'number' || !isFinite(x) || !isFinite(y)) {
       return null;
@@ -15256,7 +15261,7 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
     if (x < 0 || y < 0 || x > w || y > h) return null;
     var all = this.querySelectorAll('*');
     var best = null;
-    var bestNid = -1;
+    var bestDepth = -1;
     for (var i = 0; i < all.length; i++) {
       var el = all[i];
       if (!el || !el.getBoundingClientRect) continue;
@@ -15299,8 +15304,14 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
           ancestor = ancestor.parentElement;
         }
         if (!visible) continue;
-        var nid = el._nid | 0;
-        if (nid > bestNid) { best = el; bestNid = nid; }
+        var depth = 0;
+        for (var anc = el.parentElement; anc; anc = anc.parentElement) depth++;
+        // >= , not >: among equal-depth candidates (siblings), the later one
+        // in document order wins, matching normal-flow stacking (a later
+        // sibling paints over an earlier one absent explicit z-index). A
+        // strict > would keep whichever same-depth sibling querySelectorAll
+        // happens to visit first, regardless of document/paint order.
+        if (depth >= bestDepth) { best = el; bestDepth = depth; }
       }
     }
     return best || this.body || this.documentElement || null;
