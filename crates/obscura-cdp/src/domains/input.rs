@@ -342,15 +342,25 @@ pub async fn handle(
             let key = params.get("key").and_then(|v| v.as_str()).unwrap_or("");
             let code = params.get("code").and_then(|v| v.as_str()).unwrap_or("");
             let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let modifiers = params.get("modifiers").and_then(|v| v.as_u64()).unwrap_or(0);
+            let (_alt_key, _ctrl_key, _meta_key, shift_key) = modifier_flags(modifiers);
 
             if let Some(page) = ctx.get_session_page_mut(session_id) {
                 match event_type {
                     "keyDown" | "rawKeyDown" => {
+                        // Tab's default action (move focus) belongs in the same
+                        // round trip as the keydown dispatch, gated on the event
+                        // actually not being cancelled -- a page that traps Tab
+                        // itself (a modal dialog's focus trap, a custom widget)
+                        // calls preventDefault(), and real Chrome then leaves
+                        // focus untouched, same as it does for any other
+                        // cancelled default action.
                         let js = format!(
                             "(function() {{\
                                 var target = document.activeElement || document.body;\
                                 var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:{key},code:{code}}}));\
-                                target.dispatchEvent(evt);\
+                                var notCancelled = target.dispatchEvent(evt);\
+                                if (notCancelled && {is_tab}) {{ globalThis.__obscura_moveSequentialFocus({forward}); }}\
                             }})()",
                             // Escape backslash BEFORE single-quote (as the text
                             // path below does) so a key like "\" — Chrome's
@@ -358,6 +368,8 @@ pub async fn handle(
                             // and produce a syntax error that drops the event.
                             key = js_str(key),
                             code = js_str(code),
+                            is_tab = key == "Tab",
+                            forward = !shift_key,
                         );
                         page.evaluate(&js);
 

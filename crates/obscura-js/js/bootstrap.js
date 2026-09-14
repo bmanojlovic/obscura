@@ -2832,6 +2832,70 @@ function _focusableAncestor(el) {
   return null;
 }
 
+// The HTML spec's "sequential focus navigation" set is narrower than
+// click's: a negative tabindex (or a negative parsed value) opts an
+// otherwise-focusable element OUT of Tab order, even though it stays
+// click/script focusable. Also excludes anything not actually rendered,
+// which click never needs to check since a hit-tested target is rendered
+// by definition.
+function _isSequentiallyFocusable(el) {
+  if (!_isNormallyFocusable(el)) return false;
+  if (el.hasAttribute('tabindex')) {
+    var idx = parseInt(el.getAttribute('tabindex'), 10);
+    if (!Number.isNaN(idx) && idx < 0) return false;
+  }
+  var r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+  if (!r || r.width === 0 || r.height === 0) return false;
+  var style = null;
+  try { style = getComputedStyle(el); } catch (_e) {}
+  if (style && style.visibility === 'hidden') return false;
+  return true;
+}
+
+// Tab order per spec: elements with a positive tabindex come first, sorted
+// ascending by that value (ties keep document order -- Array#sort is
+// stable); everything else (tabindex 0 or absent) follows in document
+// order. Flat scan like elementFromPoint, for the same reason: not a tree
+// walk, just every element checked once.
+function _sequentialFocusList() {
+  var doc = globalThis.document;
+  if (!doc) return [];
+  var all = doc.querySelectorAll('*');
+  var positive = [];
+  var normal = [];
+  for (var i = 0; i < all.length; i++) {
+    var el = all[i];
+    if (!_isSequentiallyFocusable(el)) continue;
+    var tabAttr = el.hasAttribute('tabindex') ? parseInt(el.getAttribute('tabindex'), 10) : 0;
+    if (tabAttr > 0) positive.push([tabAttr, el]);
+    else normal.push(el);
+  }
+  positive.sort(function(a, b) { return a[0] - b[0]; });
+  var ordered = [];
+  for (var p = 0; p < positive.length; p++) ordered.push(positive[p][1]);
+  for (var n = 0; n < normal.length; n++) ordered.push(normal[n]);
+  return ordered;
+}
+
+// Moves focus per Tab (forward) / Shift+Tab (backward). Past either end of
+// the tab order, focus leaves the document entirely in a real browser (to
+// browser chrome); there's no chrome here, so the closest observable
+// equivalent is blurring -- document.activeElement becomes body, same as a
+// real page sees when focus moves outside it.
+globalThis.__obscura_moveSequentialFocus = function(forward) {
+  var list = _sequentialFocusList();
+  if (list.length === 0) return false;
+  var current = globalThis.document.activeElement;
+  var idx = list.indexOf(current);
+  var nextIdx = idx === -1 ? (forward ? 0 : list.length - 1) : (forward ? idx + 1 : idx - 1);
+  if (nextIdx < 0 || nextIdx >= list.length) {
+    if (current && current.blur) current.blur();
+    return true;
+  }
+  list[nextIdx].focus();
+  return true;
+};
+
 globalThis.__obscura_activateLabel = function(label, control, trusted) {
   if (!label || !control || _forwardingLabels.has(label)) return false;
   if (_isActuallyDisabled(control) || typeof control.click !== 'function') return false;
@@ -2849,10 +2913,11 @@ globalThis.__obscura_interactiveHost = function(el) {
 };
 globalThis.__obscura_focusableTarget = function(el) { return _focusableAncestor(el); };
 // Frozen so page script can neither replace the helpers to suppress or fake
-// label activation, nor delete them and make later clicks throw.
+// label activation, nor delete them and make later clicks (or Tab presses)
+// throw.
 for (const _name of ['__obscura_activateLabel', '__obscura_isDisabled',
                      '__obscura_labeledControl', '__obscura_interactiveHost',
-                     '__obscura_focusableTarget']) {
+                     '__obscura_focusableTarget', '__obscura_moveSequentialFocus']) {
   Object.defineProperty(globalThis, _name, { writable: false, configurable: false });
 }
 

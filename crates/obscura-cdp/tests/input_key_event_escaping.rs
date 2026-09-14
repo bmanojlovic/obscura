@@ -213,3 +213,103 @@ async fn insert_text_types_into_the_focused_field() {
         "insertText must type the full text with quotes, backslashes, and newlines intact"
     );
 }
+
+// Tab's default action (move focus) was entirely missing: mousedown gained a
+// focusing default action, but nothing implemented sequential focus
+// navigation, so Tab never moved focus at all and typing kept landing in
+// whichever field was already focused (see tic-f244 / issue -- reported live
+// on deezer.com/login: Tab from email silently kept typing into email,
+// password stayed empty).
+async fn serve_tab_page() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 2048];
+        let _ = socket.read(&mut buf).await.unwrap();
+        let body = r#"<html><body>
+<input id="email">
+<div id="skip-me" tabindex="-1">not in tab order</div>
+<input id="password">
+<button id="submit">go</button>
+</body></html>"#;
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = socket.write_all(resp.as_bytes()).await;
+    });
+    format!("http://{addr}/")
+}
+
+async fn active_id(ctx: &mut CdpContext, id: u64, session_id: &str) -> String {
+    let v = cdp(
+        ctx,
+        id,
+        "Runtime.evaluate",
+        json!({
+            "expression": "document.activeElement && document.activeElement.id || ''",
+            "returnByValue": true,
+        }),
+        session_id,
+    )
+    .await;
+    v["result"]["value"].as_str().unwrap_or_default().to_string()
+}
+
+async fn tab(ctx: &mut CdpContext, id: u64, session_id: &str, shift: bool) {
+    let modifiers = if shift { 8 } else { 0 };
+    cdp(
+        ctx,
+        id,
+        "Input.dispatchKeyEvent",
+        json!({"type": "rawKeyDown", "key": "Tab", "code": "Tab", "modifiers": modifiers}),
+        session_id,
+    )
+    .await;
+    cdp(
+        ctx,
+        id + 1,
+        "Input.dispatchKeyEvent",
+        json!({"type": "keyUp", "key": "Tab", "code": "Tab", "modifiers": modifiers}),
+        session_id,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn tab_key_moves_focus_forward_and_skips_negative_tabindex() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve_tab_page().await;
+    let mut ctx = CdpContext::new();
+    let page_id = ctx.create_page();
+    let session_id = "session-1";
+    ctx.sessions.insert(session_id.to_string(), page_id.clone());
+
+    cdp(&mut ctx, 1, "Page.navigate", json!({"url": url, "waitUntil": "load"}), session_id).await;
+    cdp(
+        &mut ctx,
+        2,
+        "Runtime.evaluate",
+        json!({"expression": "document.getElementById('email').focus()"}),
+        session_id,
+    )
+    .await;
+
+    tab(&mut ctx, 10, session_id, false).await;
+    assert_eq!(
+        active_id(&mut ctx, 20, session_id).await,
+        "password",
+        "Tab must skip the tabindex=-1 element and land on the next real field"
+    );
+
+    tab(&mut ctx, 30, session_id, false).await;
+    assert_eq!(active_id(&mut ctx, 40, session_id).await, "submit");
+
+    tab(&mut ctx, 50, session_id, true).await;
+    assert_eq!(
+        active_id(&mut ctx, 60, session_id).await,
+        "password",
+        "Shift+Tab must move focus backward"
+    );
+}
