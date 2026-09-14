@@ -367,6 +367,7 @@
   ],
   "z-index": [
     {"name": "positive layer", "color": "#008000", "width": 200, "height": 100},
-    {"name": "negative layer", "color": "#ffa500", "width": 260, "height": 110}
+    {"name": "negative layer", "color": "#ffa500", "width": 260, "height": 110},
+    {"name": "text hidden under overlay", "color": "#800080", "width": 300, "height": 100}
   ]
 }

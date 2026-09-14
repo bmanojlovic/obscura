@@ -3679,7 +3679,7 @@ fn paint_laid_dom_scrolled(
         }
     }
 
-    for (paint_index, nid) in paint_order.into_iter().enumerate() {
+    for (paint_index, nid) in paint_order.iter().copied().enumerate() {
         if svg_subtree_skip.contains(&nid) {
             continue;
         }
@@ -4871,61 +4871,49 @@ fn paint_laid_dom_scrolled(
                 raster_scale,
             );
         }
-    }
 
-    // Inline formatting contexts shaped by cosmic-text (paragraphs, headings,
-    // cells, labels) draw last, in tree order, so their glyphs sit above the
-    // box backgrounds/borders painted in the loop above. Each item already
-    // carries its final origin and clip from `TextEngine::finalize`.
-    for nid in paint_nodes {
-        if svg_subtree_skip.contains(&nid) || opacity_subtree_skip.contains(&nid) {
-            continue;
-        }
+        // Inline formatting contexts shaped by cosmic-text (paragraphs,
+        // headings, cells, labels) draw right here, immediately after this
+        // element's own background/border/generated content, so their
+        // glyphs sit above their own container's box. This MUST happen at
+        // this element's own position in `paint_order` (the stacking-aware
+        // sequence), not in a separate final pass over every node on the
+        // page: a later sibling stacking context (a position:fixed/absolute
+        // overlay with a higher z-index) is painted by its own recursive
+        // call earlier in this same loop and must stay on top of this text,
+        // which a page-wide "draw all text last" pass would defeat -- any
+        // shaped text anywhere on the page would always win, painting over
+        // a higher-stacked overlay's box regardless of where in the
+        // document that text lives (issue: an Akamai challenge overlay's
+        // background correctly covered the page, but the underlying page's
+        // own labels still visibly bled through on top of it).
         let whole = laid.ifc_items.get(&nid).copied();
         let run_items = laid.run_ifc_items.get(&nid).cloned();
-        if whole.is_none() && run_items.is_none() {
-            continue;
-        }
-        if laid
+        let text_effectively_invisible = laid
             .styles
             .get(&nid)
             .map(|s| s.effectively_invisible)
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        // Shift the shaped glyphs by the same accumulated translate as the
-        // container's box so text under a transformed ancestor moves with
-        // it. Computed before the mutable `paint_item` borrow.
-        let off = scroll_state.translation_for(laid, nid);
-        let overflow_clip = scroll_state.shaped_text_overflow_clip_for(laid, nid);
-        let clip = overflow_clip
-            .as_ref()
-            .map(|clip| clip.viewport_rect(scroll_state.surface_extent.unwrap_or(viewport)));
-        let clip_mask = overflow_clip.as_ref().and_then(|clip| {
-            cached_overflow_clip_mask(
-                &mut overflow_mask_cache,
-                pixmap.width(),
-                pixmap.height(),
-                clip,
-                scroll_state.surface_extent.unwrap_or(viewport),
-            )
-        });
-        if let Some(idx) = whole {
-            laid.text_engine.paint_item_with_clip_mask_scaled_for_print(
-                idx,
-                &mut pixmap,
-                off,
-                clip,
-                clip_mask.as_deref(),
-                raster_scale,
-                print_economy,
-            );
-        }
-        // Anonymous inline-run leaves of a mixed block (see
-        // `build_mixed_block`), pinned to their own boxes at finalize.
-        if let Some(items) = run_items {
-            for idx in items {
+            .unwrap_or(false);
+        if (whole.is_some() || run_items.is_some()) && !text_effectively_invisible {
+            // Shift the shaped glyphs by the same accumulated translate as
+            // the container's box so text under a transformed ancestor
+            // moves with it. Computed before the mutable `paint_item`
+            // borrow.
+            let off = scroll_state.translation_for(laid, nid);
+            let overflow_clip = scroll_state.shaped_text_overflow_clip_for(laid, nid);
+            let clip = overflow_clip.as_ref().map(|clip| {
+                clip.viewport_rect(scroll_state.surface_extent.unwrap_or(viewport))
+            });
+            let clip_mask = overflow_clip.as_ref().and_then(|clip| {
+                cached_overflow_clip_mask(
+                    &mut overflow_mask_cache,
+                    pixmap.width(),
+                    pixmap.height(),
+                    clip,
+                    scroll_state.surface_extent.unwrap_or(viewport),
+                )
+            });
+            if let Some(idx) = whole {
                 laid.text_engine.paint_item_with_clip_mask_scaled_for_print(
                     idx,
                     &mut pixmap,
@@ -4935,6 +4923,21 @@ fn paint_laid_dom_scrolled(
                     raster_scale,
                     print_economy,
                 );
+            }
+            // Anonymous inline-run leaves of a mixed block (see
+            // `build_mixed_block`), pinned to their own boxes at finalize.
+            if let Some(items) = run_items {
+                for idx in items {
+                    laid.text_engine.paint_item_with_clip_mask_scaled_for_print(
+                        idx,
+                        &mut pixmap,
+                        off,
+                        clip,
+                        clip_mask.as_deref(),
+                        raster_scale,
+                        print_economy,
+                    );
+                }
             }
         }
     }
@@ -14201,6 +14204,33 @@ mod tests {
                 "{label} high-z descendant escaped its auto-z stacking context: {pixel:?}",
             );
         }
+    }
+
+    // Shaped inline text (the cosmic-text `ifc_items` path used by ordinary
+    // paragraphs, headings, and labels -- the common case, not the per-word
+    // `text_runs` fallback) used to paint in one unconditional final pass
+    // over every node on the page, in flat DOM order, entirely ignoring the
+    // stacking-aware `paint_order` the box tree above it already respects.
+    // A normal-flow text node earlier in the DOM would therefore always
+    // paint on top of a LATER sibling's higher-stacked box, even though
+    // that box's own background correctly painted over everything before
+    // it. Reproduced on deezer.com/login: an Akamai challenge overlay's
+    // background correctly covered the page, but the underlying page's own
+    // form labels still visibly bled through on top of it.
+    #[test]
+    fn normal_flow_text_does_not_escape_a_higher_stacked_overlay() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0;background:white">
+                <div style="font-size:20px;color:red">plain text here</div>
+                <div style="position:absolute;z-index:999;left:0;top:0;width:100px;height:50px;background:blue"></div>
+            </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (200.0, 100.0), None).expect("pixmap");
+        let pixel = pixmap.pixel(10, 10).unwrap();
+        assert!(
+            pixel.blue() > 240 && pixel.red() < 20 && pixel.green() < 20,
+            "normal-flow text painted over a later, higher-stacked overlay: {pixel:?}",
+        );
     }
 
     #[test]
