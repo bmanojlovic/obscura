@@ -1,0 +1,35 @@
+# Dev-only image build for the build/local-testing integration branch.
+# Never used for the real release image (see docker.yml) and never merged to
+# main -- this workflow only exists on the utility build branch, which
+# combines in-flight ticket fixes for app testing ahead of their individual
+# upstream PRs.
+name: Dev image (build/local-testing)
+
+on:
+  push:
+    branches:
+      - build/local-testing
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build dev image (cached base)
+        env:
+          REGISTRY: ghcr.io
+          IMAGE_OWNER: bmanojlovic
+          PUSH: "1"
+        run: ./scripts/dev-build.sh
