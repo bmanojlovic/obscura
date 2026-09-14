@@ -9,4 +9,9 @@
   <div style="width:220px;height:90px;background:blue"></div>
   <div style="position:absolute;top:0;left:0;width:260px;height:110px;background:orange;z-index:-1"></div>
 </div>
+<p>C: normal-flow text declared BEFORE a later, higher z-index overlay must be fully covered by it (solid purple, no text bleeding through):</p>
+<div style="position:relative;height:120px">
+  <div style="font-size:28px;color:red">this text must be hidden</div>
+  <div style="position:absolute;top:0;left:0;width:300px;height:100px;background:purple;z-index:999"></div>
+</div>
 </body></html>
