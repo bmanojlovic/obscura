@@ -104,6 +104,20 @@ pub(crate) struct CanvasBackingSurface {
     pub pixels: JsBuffer,
 }
 
+/// A child frame's own document, rendered into RGBA pixels for compositing
+/// into the host document's screenshot (issue: Akamai/OOPIF-style iframe
+/// content never appeared in a capture). Unlike [`CanvasBackingSurface`] this
+/// is not retained from V8 — it is recomputed by `refresh_iframe_surfaces`
+/// each capture from the frame realm's own DOM, same-origin or not, since
+/// compositing pixels into a screenshot is not the scripting-level access
+/// `contentDocument` correctly denies a cross-origin frame.
+#[cfg(feature = "render")]
+pub(crate) struct IframeBackingSurface {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+}
+
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
     pub url: String,
@@ -275,6 +289,18 @@ pub struct ObscuraState {
     /// updates this resource independently of retained style/layout geometry.
     #[cfg(feature = "render")]
     pub(crate) canvas_surfaces: HashMap<NodeId, CanvasBackingSurface>,
+    /// `<iframe>` element node id (in *this* document) -> the frame id it
+    /// hosts, recorded by `op_frame_bind_element` when the frame's src loads.
+    /// Lets `refresh_iframe_surfaces` find, for each iframe box painted here,
+    /// which realm's document to render for it.
+    #[cfg(feature = "render")]
+    pub(crate) frame_elements: HashMap<NodeId, u32>,
+    /// Each hosted frame's own document, pre-rendered to RGBA by
+    /// `refresh_iframe_surfaces` immediately before a capture, keyed by the
+    /// `<iframe>` node id in this document. Consulted the same way
+    /// `canvas_surfaces` is, through `CanvasSurfaceSource`.
+    #[cfg(feature = "render")]
+    pub(crate) iframe_surfaces: HashMap<NodeId, IframeBackingSurface>,
     #[cfg(feature = "render")]
     pub viewport: (f32, f32),
     /// Root scrolling offset in CSS pixels. With render enabled this is
@@ -422,6 +448,10 @@ impl ObscuraState {
             dynamic_fonts: Vec::new(),
             #[cfg(feature = "render")]
             canvas_surfaces: HashMap::new(),
+            #[cfg(feature = "render")]
+            frame_elements: HashMap::new(),
+            #[cfg(feature = "render")]
+            iframe_surfaces: HashMap::new(),
             #[cfg(feature = "render")]
             viewport: (1280.0, 720.0),
             #[cfg(feature = "render")]
@@ -654,7 +684,7 @@ impl RealmStates {
         self.entries.retain(|(known, _, _)| known != context);
     }
 
-    fn by_frame_id(&self, frame_id: u32) -> Option<SharedState> {
+    pub(crate) fn by_frame_id(&self, frame_id: u32) -> Option<SharedState> {
         self.entries
             .iter()
             .find(|(_, id, _)| *id == frame_id)
@@ -4665,6 +4695,28 @@ fn op_frame_document_ready(
     frame_id
 }
 
+/// Records which frame id an `<iframe>` element (identified by its node id in
+/// *this* realm's document) now hosts, so a later capture's
+/// `refresh_iframe_surfaces` knows which realm's document to render and
+/// composite into that element's box. Called from `_loadIframeSrc` right
+/// after `op_frame_document_ready` hands back the new frame id -- both calls
+/// run in the realm that owns the `<iframe>` tag, which is the page for a
+/// top-level frame and another frame's realm for a nested one, so this must
+/// resolve the *calling* realm's state, not always the page's.
+#[cfg(feature = "render")]
+#[op2(fast)]
+fn op_frame_bind_element(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    nid: u32,
+    frame_id: u32,
+) -> bool {
+    let gs = realm_state(scope, state);
+    let mut gs = gs.borrow_mut();
+    gs.frame_elements.insert(NodeId::new(nid), frame_id);
+    true
+}
+
 /// Whether async host work can be scheduled without aborting the isolate.
 ///
 /// Some low-level embedders intentionally execute a synchronous expression
@@ -5565,6 +5617,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_set_dynamic_fonts());
         ops.push(op_canvas_register_surface());
         ops.push(op_canvas_paint_damage());
+        ops.push(op_frame_bind_element());
         ops.push(op_image_metadata());
         ops.push(op_load_image_metadata());
         ops.push(op_layout_geometry());

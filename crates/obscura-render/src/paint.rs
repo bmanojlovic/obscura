@@ -2206,6 +2206,41 @@ pub fn paint_dom_scrolled_at_animation_time_with_surface_color_and_resources(
     paint_prepared_with_surface_color(tree, &mut prepared, resources, scroll, surface_color)
 }
 
+/// As [`paint_dom_scrolled_at_animation_time_with_surface_color_and_resources`],
+/// but also compositing replaced content (canvas backing stores, and a child
+/// frame's own rendered document for `<iframe>`) supplied by `canvas_surfaces`.
+/// This is how a subframe's document — fetched and given its own realm, but
+/// otherwise invisible to `paint_dom`, which only ever sees one `DomTree` —
+/// gets its pixels into a parent capture: the caller renders the frame's own
+/// tree first (recursively, for nested frames) and passes the result in here
+/// keyed by the `<iframe>` element's node id.
+pub fn paint_dom_scrolled_at_animation_time_with_surface_color_and_resources_and_canvas_surfaces(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    scroll: (f32, f32),
+    animation_sample_time: crate::AnimationSampleTime,
+    surface_color: [u8; 4],
+    resources: &mut RenderResourceCache,
+    canvas_surfaces: &dyn CanvasSurfaceSource,
+) -> Option<Pixmap> {
+    let mut prepared = prepare_dom_at_animation_time(
+        tree,
+        viewport,
+        base_url,
+        resources,
+        animation_sample_time,
+    )?;
+    paint_prepared_with_surface_color_and_canvas_surfaces(
+        tree,
+        &mut prepared,
+        resources,
+        scroll,
+        surface_color,
+        canvas_surfaces,
+    )
+}
+
 /// Resolve image candidates and web fonts, then create the single final layout
 /// shared by CSS geometry consumers and repeated paint.
 pub fn prepare_dom(
@@ -2742,6 +2777,24 @@ fn paint_prepared_with_surface_color(
     scroll: (f32, f32),
     surface_color: [u8; 4],
 ) -> Option<Pixmap> {
+    paint_prepared_with_surface_color_and_canvas_surfaces(
+        tree,
+        prepared,
+        resources,
+        scroll,
+        surface_color,
+        &EMPTY_CANVAS_SURFACES,
+    )
+}
+
+fn paint_prepared_with_surface_color_and_canvas_surfaces(
+    tree: &DomTree,
+    prepared: &mut PreparedRender,
+    resources: &mut RenderResourceCache,
+    scroll: (f32, f32),
+    surface_color: [u8; 4],
+    canvas_surfaces: &dyn CanvasSurfaceSource,
+) -> Option<Pixmap> {
     validate_capture_region(CaptureRegion::new(
         scroll.0,
         scroll.1,
@@ -2769,7 +2822,7 @@ fn paint_prepared_with_surface_color(
         pixmap,
         resources,
         &prepared.selected_images,
-        &EMPTY_CANVAS_SURFACES,
+        canvas_surfaces,
         &prepared.svg_fonts,
         prepared.content_size,
         &prepared.viewport_fixed,
@@ -4398,12 +4451,14 @@ fn paint_laid_dom_scrolled(
             }
         }
 
-        if box_on_surface && name.local.as_ref() == "canvas" {
+        if box_on_surface && matches!(name.local.as_ref(), "canvas" | "iframe") {
             if let Some(surface) = canvas_surfaces.surface(nid) {
-                // A canvas bitmap is replaced content: CSS sizing and
-                // object-fit operate on the content box, never the padding or
-                // border box. Keep padding available for the element's own
-                // background and inset the rounded clip to the same edge.
+                // A canvas bitmap, or a child frame's own rendered document
+                // (see `paint_dom_scrolled_at_animation_time_with_surface_color_and_resources_and_canvas_surfaces`),
+                // is replaced content: CSS sizing and object-fit operate on
+                // the content box, never the padding or border box. Keep
+                // padding available for the element's own background and
+                // inset the rounded clip to the same edge.
                 let content_insets = crate::Sides {
                     top: style.border.top + style.padding.top,
                     right: style.border.right + style.padding.right,

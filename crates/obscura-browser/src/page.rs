@@ -6193,6 +6193,88 @@ mod tests {
         assert_eq!(page.frame_urls().len(), 1);
     }
 
+    async fn spawn_iframe_content_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let read = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                    let body = if request.starts_with("GET /child.html ") {
+                        "<html><body style=\"margin:0;background:#00ff00\"></body></html>"
+                    } else {
+                        "<html><body style=\"margin:0\">\
+                         <iframe src=\"/child.html\" style=\"position:absolute;top:0;left:0;\
+                         width:120px;height:90px;border:0\"></iframe></body></html>"
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    /// The render/screenshot pipeline never had any code path that painted a
+    /// child frame's own document -- `paint_dom` only ever sees one `DomTree`
+    /// -- so an `<iframe>`'s box stayed permanently blank in every capture no
+    /// matter how long the frame had to load (an Akamai/reCAPTCHA challenge
+    /// iframe, for instance, never became visible in a screenshot at all).
+    /// `refresh_iframe_surfaces` renders each hosted frame's document
+    /// separately and composites it in as replaced content, the same way a
+    /// live `<canvas>` backing store already was.
+    #[cfg(feature = "render")]
+    #[tokio::test]
+    async fn screenshot_composites_an_iframes_own_document() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let base = spawn_iframe_content_server().await;
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "iframe-paint".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("iframe-paint".to_string(), context);
+        page.set_viewport((200.0, 150.0));
+        page.navigate(&base).await.unwrap();
+        assert_eq!(
+            page.frame_urls().len(),
+            1,
+            "the page never built its child frame, so this proves nothing"
+        );
+
+        let png = page.screenshot(page.viewport).expect("host screenshot");
+        use image::GenericImageView;
+        let image = image::load_from_memory(&png).expect("decode screenshot png");
+
+        // Inside the iframe's box: must show the CHILD document's own
+        // background, not the blank/white the host paints behind it.
+        let inside = image.get_pixel(60, 45);
+        assert!(
+            inside[1] > 200 && inside[0] < 80 && inside[2] < 80,
+            "iframe box must show the child document's green background, got {:?}",
+            inside.0
+        );
+
+        // Outside the iframe's box: still the host's own (default white)
+        // background -- proves the child content landed only inside the
+        // iframe's box, not smeared across the whole capture.
+        let outside = image.get_pixel(180, 140);
+        assert!(
+            outside[0] > 200 && outside[1] > 200 && outside[2] > 200,
+            "outside the iframe box must stay the host's background, got {:?}",
+            outside.0
+        );
+    }
+
     fn frame_page(name: &str) -> super::Page {
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
             name.to_string(),
