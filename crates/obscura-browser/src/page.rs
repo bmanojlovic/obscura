@@ -7362,6 +7362,111 @@ mod tests {
         );
     }
 
+    /// The top page and the iframe's own document are on different origins,
+    /// but the iframe fetches back to ITS OWN origin (same-origin from the
+    /// frame's point of view -- exactly the shape an Akamai-style challenge
+    /// widget uses: `account.example` embeds an `<iframe>` from
+    /// `challenge.example`, whose own script calls back to
+    /// `challenge.example`, not to `account.example`).
+    async fn spawn_cross_origin_iframe_and_api_server() -> (String, String) {
+        let iframe_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let iframe_addr = iframe_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = iframe_listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let read = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                    let (content_type, body) = if request.starts_with("GET /frame.html ") {
+                        (
+                            "text/html",
+                            "<html><body><script>\
+                             fetch('/api').then(function(r) {\
+                               return r.text().then(function(t) {\
+                                 globalThis.__result = { status: r.status, ok: r.ok, body: t };\
+                               });\
+                             }).catch(function(e) {\
+                               globalThis.__result = { error: String((e && e.message) || e) };\
+                             });\
+                             </script></body></html>"
+                                .to_string(),
+                        )
+                    } else {
+                        ("application/json", "{\"cleared\":true}".to_string())
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        content_type,
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        let iframe_base = format!("http://{iframe_addr}/");
+
+        let top_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let top_addr = top_listener.local_addr().unwrap();
+        let iframe_base_for_top = iframe_base.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = top_listener.accept().await {
+                let iframe_base = iframe_base_for_top.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let _ = socket.read(&mut buf).await.unwrap_or(0);
+                    let body = format!(
+                        "<html><body><iframe src=\"{iframe_base}frame.html\"></iframe></body></html>"
+                    );
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{top_addr}/"), iframe_base)
+    }
+
+    /// A fetch a frame's own script issues back to ITS OWN origin must not be
+    /// treated as cross-origin just because the *embedding page* is on a
+    /// different origin -- the CORS check has to use the calling realm's own
+    /// origin, not the top-level page's.
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_fetch_to_its_own_origin_is_not_treated_as_cross_origin() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let (top_base, _iframe_base) = spawn_cross_origin_iframe_and_api_server().await;
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "frame-fetch-own-origin".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("frame-fetch-own-origin".to_string(), context);
+        page.navigate(&top_base).await.unwrap();
+        page.settle(2_000).await;
+        assert_eq!(
+            page.frame_urls().len(),
+            1,
+            "the page never built its child frame, so this proves nothing"
+        );
+
+        let result = page
+            .evaluate_in_frame(0, "globalThis.__result")
+            .expect("evaluate in frame");
+        assert_eq!(
+            result,
+            serde_json::json!({ "status": 200, "ok": true, "body": "{\"cleared\":true}" }),
+            "a frame's fetch back to its own origin must not be blocked as cross-origin CORS \
+             just because the embedding page is on a different origin"
+        );
+    }
+
     fn frame_page(name: &str) -> super::Page {
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
             name.to_string(),
