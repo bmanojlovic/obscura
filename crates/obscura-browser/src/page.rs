@@ -7917,6 +7917,36 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn module_script_loads_from_a_data_url() {
+        // A data URL carries its module source itself, so it needs no
+        // transport: sending it to the HTTP client failed with "Failed to
+        // fetch module data:...", silently dropping the module and every
+        // importer behind it.
+        let mut page = import_map_test_page(
+            "data-url-module",
+            "http://example.test",
+            r#"<html><head>
+            <script type="module">
+                import answer from "data:text/javascript,export default 42";
+                globalThis.__data_module_answer = answer;
+            </script>
+            <script type="module" src="data:text/javascript,globalThis.__data_module_src = 'ran';"></script>
+        </head><body></body></html>"#,
+        );
+        page.execute_scripts().await;
+
+        let js = page.js.as_mut().unwrap();
+        assert_eq!(
+            js.evaluate("globalThis.__data_module_answer").unwrap(),
+            serde_json::json!(42.0)
+        );
+        assert_eq!(
+            js.evaluate("globalThis.__data_module_src").unwrap(),
+            serde_json::json!("ran")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn later_import_map_adds_unrelated_rule_without_rebinding_resolved_rule() {
         let (base, requests) = spawn_parser_import_map_server(2);
         let mut page = import_map_test_page(

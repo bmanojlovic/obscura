@@ -4,6 +4,7 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64::engine::general_purpose::STANDARD_NO_PAD as BASE64_NO_PAD;
 
 use deno_core::error::ModuleLoaderError;
 use deno_core::ModuleLoadOptions;
@@ -154,6 +155,77 @@ fn io_err(msg: String) -> ModuleLoaderError {
     JsErrorBox::from_err(std::io::Error::new(std::io::ErrorKind::Other, msg))
 }
 
+/// Decodes a `data:` URL's own payload as module source text.
+///
+/// A data URL is fetchable per the URL and HTML specs, and a module graph can
+/// name one directly (`import x from "data:text/javascript,..."`) or through
+/// `<script type="module" src="data:...">`. There is no transport behind it:
+/// the payload *is* the resource. The fragment is not part of that resource,
+/// `;base64` selects base64 decoding (padding optional, ASCII whitespace
+/// ignored) and anything else is percent-decoded. The declared media type is
+/// otherwise ignored, since a module is JavaScript text either way.
+fn decode_data_module_url(url: &str) -> Result<String, ModuleLoaderError> {
+    let payload = url
+        .strip_prefix("data:")
+        .ok_or_else(|| io_err(format!("Not a data URL: {}", url)))?;
+    let (meta, data) = payload
+        .split_once(',')
+        .ok_or_else(|| io_err(format!("Invalid data URL, no comma: {}", url)))?;
+    let data = data.split('#').next().unwrap_or(data);
+    let is_base64 = meta
+        .split(';')
+        .any(|part| part.eq_ignore_ascii_case("base64"));
+    if !is_base64 {
+        return percent_decode_data_payload(data);
+    }
+    let compact: String = data
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
+    let bytes = BASE64
+        .decode(&compact)
+        .or_else(|_| BASE64_NO_PAD.decode(&compact))
+        .map_err(|e| io_err(format!("Invalid base64 in data URL: {}", e)))?;
+    String::from_utf8(bytes)
+        .map_err(|e| io_err(format!("Data URL payload is not UTF-8: {}", e)))
+}
+
+/// Percent-decodes a non-base64 data URL payload. `+` is literal here: form
+/// encoding's space substitution does not apply to data URLs.
+fn percent_decode_data_payload(data: &str) -> Result<String, ModuleLoaderError> {
+    fn hex(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = data.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let (Some(high), Some(low)) = (
+                bytes.get(index + 1).copied().and_then(hex),
+                bytes.get(index + 2).copied().and_then(hex),
+            ) else {
+                return Err(io_err(format!(
+                    "Invalid percent escape in data URL payload at byte {}",
+                    index
+                )));
+            };
+            out.push(high * 16 + low);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(out)
+        .map_err(|e| io_err(format!("Data URL payload is not UTF-8: {}", e)))
+}
+
 impl ModuleLoader for ObscuraModuleLoader {
     fn resolve(
         &self,
@@ -211,6 +283,23 @@ impl ModuleLoader for ObscuraModuleLoader {
         let activity = self.activity.clone();
         let loaded_specifiers = self.loaded_specifiers.clone();
         loaded_specifiers.borrow_mut().push(url.clone());
+        // A data URL carries its module source itself, so it never reaches the
+        // network: sending it to the HTTP client fails with "Failed to fetch
+        // module data:...", which silently drops the module and everything
+        // importing it. Decode the payload here instead. Nothing is recorded
+        // as a network request, and none of the transport wiring below (proxy,
+        // stealth identity, cookie jar, activity counter) applies.
+        if module_specifier.scheme() == "data" {
+            return ModuleLoadResponse::Sync(decode_data_module_url(&url).map(|code| {
+                ModuleSource::new_with_redirect(
+                    deno_core::ModuleType::JavaScript,
+                    ModuleSourceCode::String(code.into()),
+                    module_specifier,
+                    module_specifier,
+                    None,
+                )
+            }));
+        }
         // Register before returning the future. The lifecycle can inspect the
         // runtime between deno_core accepting the load and first polling it.
         // Keeping the guard inside the future makes cancellation/navigation
@@ -362,5 +451,80 @@ impl ModuleLoader for ObscuraModuleLoader {
                 Err(error) => Err(io_err(error)),
             }
         })))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_data_module_url;
+
+    #[test]
+    fn data_module_payload_is_the_source() {
+        assert_eq!(
+            decode_data_module_url("data:text/javascript,export default 42").unwrap(),
+            "export default 42"
+        );
+    }
+
+    #[test]
+    fn data_module_percent_decodes() {
+        assert_eq!(
+            decode_data_module_url("data:text/javascript,window.__a%20%3D%201").unwrap(),
+            "window.__a = 1"
+        );
+    }
+
+    #[test]
+    fn data_module_plus_stays_literal() {
+        assert_eq!(
+            decode_data_module_url("data:text/javascript,let%20a%3D1+2").unwrap(),
+            "let a=1+2"
+        );
+    }
+
+    #[test]
+    fn data_module_fragment_is_not_part_of_the_payload() {
+        assert_eq!(
+            decode_data_module_url("data:text/javascript,let%20a%3D1#fragment").unwrap(),
+            "let a=1"
+        );
+    }
+
+    #[test]
+    fn data_module_base64_with_padding() {
+        assert_eq!(
+            decode_data_module_url("data:text/javascript;base64,ZXhwb3J0IGRlZmF1bHQgNw==").unwrap(),
+            "export default 7"
+        );
+    }
+
+    #[test]
+    fn data_module_base64_padding_optional_and_whitespace_ignored() {
+        assert_eq!(
+            decode_data_module_url(
+                "data:text/javascript;base64,ZXhwb3J0IGRlZmF1bHQgNw"
+            )
+            .unwrap(),
+            "export default 7"
+        );
+        assert_eq!(
+            decode_data_module_url(
+                "data:text/javascript;base64;charset=utf-8,ZXhwb3J0IGRl\nZmF1bHQgNw"
+            )
+            .unwrap(),
+            "export default 7"
+        );
+    }
+
+    #[test]
+    fn data_module_rejects_malformed_urls() {
+        for url in [
+            "data:text/javascript;base64,not base64!",
+            "data:text/javascript,truncated%2",
+            "data:text/javascript",
+            "https://example.com/mod.js",
+        ] {
+            assert!(decode_data_module_url(url).is_err(), "should reject {url}");
+        }
     }
 }
