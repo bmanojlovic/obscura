@@ -5009,3 +5009,90 @@ fn float_ending_at_rounded_segment_boundary_does_not_panic() {
 
     assert_eq!(place(&mut context, 400.3333, FloatDirection::Left).y, 1859.0);
 }
+
+#[test]
+fn absolute_calc_insets_resolve_against_the_positioned_ancestor_padding_box() {
+    // A functional percentage inset must use the nearest positioned
+    // ancestor's padding box, not the direct parent's content box and not the
+    // viewport. The static wrapper makes the two boxes very different, and the
+    // padding on the positioned ancestor checks that padding is included.
+    let tree = parse_html(
+        r#"<style>
+            html, body { margin:0 }
+            #cb { position:relative; width:200px; height:100px; margin:20px 0 0 30px;
+                  padding:10px 20px; border:5px solid }
+            #static { width:50px; height:30px; margin:7px; padding:3px }
+            .box { position:absolute; width:10px; height:10px }
+        </style>
+        <div id="cb"><div id="static">
+            <div id="start" class="box" style="left:calc(100% + 4px); top:calc(100% + 4px)"></div>
+            <div id="end" class="box" style="right:calc(100% - 4px); bottom:calc(100% - 4px)"></div>
+            <div id="half" class="box" style="left:50%; top:50%"></div>
+            <div id="full" class="box" style="left:100%; top:0"></div>
+        </div></div>"#,
+    );
+    let layout = layout_dom(&tree, (800.0, 400.0));
+    let rect = |id: &str| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let cb = rect("cb");
+    // Border box x=30, border=5, so the padding box starts at x=35. Its width
+    // is the 200px content width plus 40px of horizontal padding.
+    let origin_x = cb.x + 5.0;
+    let origin_y = cb.y + 5.0;
+    let padding_width = 240.0;
+    let padding_height = 120.0;
+
+    let start = rect("start");
+    assert_eq!(start.x, origin_x + padding_width + 4.0, "{start:?}");
+    assert_eq!(start.y, origin_y + padding_height + 4.0, "{start:?}");
+
+    let end = rect("end");
+    assert_eq!(end.x + end.width, origin_x + 4.0, "{end:?}");
+    assert_eq!(end.y + end.height, origin_y + 4.0, "{end:?}");
+
+    let half = rect("half");
+    assert_eq!(half.x, origin_x + padding_width / 2.0, "{half:?}");
+    assert_eq!(half.y, origin_y + padding_height / 2.0, "{half:?}");
+
+    let full = rect("full");
+    assert_eq!(full.x, origin_x + padding_width, "{full:?}");
+}
+
+#[test]
+fn fixed_calc_insets_resolve_against_the_viewport() {
+    let tree = parse_html(
+        r#"<style>
+            html, body { margin:0 }
+            #cb { position:relative; width:40px; height:30px; margin-left:100px }
+            #fixed { position:fixed; left:calc(100% - 10px); top:calc(50% + 2px);
+                     width:10px; height:10px }
+        </style>
+        <div id="cb"><div id="fixed"></div></div>"#,
+    );
+    let viewport = (400.0, 300.0);
+    let layout = layout_dom(&tree, viewport);
+    let fixed = layout.rects[&tree.get_element_by_id("fixed").unwrap()];
+    assert_eq!(fixed.x, viewport.0 - 10.0, "{fixed:?}");
+    assert_eq!(fixed.y, viewport.1 / 2.0 + 2.0, "{fixed:?}");
+}
+
+#[test]
+fn indefinite_column_flex_zero_basis_uses_content_before_max_height() {
+    let tree = parse_html(
+        r#"<style>html, body { margin:0 }</style>
+        <div id="container" style="display:flex; flex-direction:column; width:280px; max-height:300px">
+          <div id="header" style="height:24px">header</div>
+          <div id="body" style="flex:1; min-height:0; overflow-y:auto">
+            <div style="height:40px">a</div><div style="height:40px">b</div><div style="height:40px">c</div>
+          </div>
+        </div>"#,
+    );
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    let rect = |id: &str| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let container = rect("container");
+    let header = rect("header");
+    let body = rect("body");
+    assert_eq!(container.height, 144.0, "{container:?}");
+    assert_eq!(header.height, 24.0, "{header:?}");
+    assert_eq!(body.y, 24.0, "{body:?}");
+    assert_eq!(body.height, 120.0, "{body:?}");
+}
