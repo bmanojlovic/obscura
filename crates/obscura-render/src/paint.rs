@@ -1959,6 +1959,29 @@ impl PreparedRender {
         out.insert("min-height", dimension_css(style.min_height, "auto"));
         out.insert("max-width", dimension_css(style.max_width, "none"));
         out.insert("max-height", dimension_css(style.max_height, "none"));
+        // For an absolutely positioned box CSSOM exposes the used inset
+        // relative to its containing block. Without these keys the JS fallback
+        // derives them from the bounding rect, returning page coordinates (and
+        // `bottom:0` reads back as the document height) instead of used edges.
+        let absolutely_positioned =
+            matches!(style.position, Some(taffy::Position::Absolute)) && !style.position_sticky;
+        for (name, index) in [
+            ("top", 0),
+            ("right", 1),
+            ("bottom", 2),
+            ("left", 3),
+        ] {
+            let value = if absolutely_positioned {
+                style.used_insets[index]
+                    .map(css_px)
+                    .unwrap_or_else(|| "auto".to_string())
+            } else {
+                style.inset[index]
+                    .map(|value| dimension_css(value, "auto"))
+                    .unwrap_or_else(|| "auto".to_string())
+            };
+            out.insert(name, value);
+        }
         out.insert(
             "box-sizing",
             if style.box_sizing == crate::BoxSizing::BorderBox {
@@ -4664,6 +4687,24 @@ fn paint_laid_dom_scrolled(
         let clip = overflow_clip
             .as_ref()
             .map(|clip| clip.viewport_rect(scroll_state.surface_extent.unwrap_or(viewport)));
+        // UA form-control rendering clips the value/placeholder/label to the
+        // control's padding box even when `overflow` computes to visible. A
+        // 1x1 focus target must therefore paint no glyphs at all.
+        let control_text_clip = scroll_state
+            .form_control_text_clip(laid, nid, true)
+            .map(|clip| clip.viewport_rect(scroll_state.surface_extent.unwrap_or(viewport)));
+        let text_clip = match (clip, control_text_clip) {
+            (Some(existing), Some(control)) => Some(existing.intersect(&control).unwrap_or(
+                crate::Rect {
+                    x: control.x,
+                    y: control.y,
+                    width: 0.0,
+                    height: 0.0,
+                },
+            )),
+            (None, Some(control)) => Some(control),
+            (existing, None) => existing,
+        };
         let cull_rect = rect;
         let visible_rect = match clip {
             Some(c) => match cull_rect.intersect(&c) {
@@ -5285,7 +5326,7 @@ fn paint_laid_dom_scrolled(
                     style.font_family.as_deref(),
                     style.letter_spacing.unwrap_or(0.0),
                     style.word_spacing.unwrap_or(0.0),
-                    Some(visible_rect),
+                    text_clip,
                     element_clip_mask,
                     raster_scale,
                 );
@@ -5466,7 +5507,7 @@ fn paint_laid_dom_scrolled(
                                 style.font_family.as_deref(),
                                 style.letter_spacing.unwrap_or(0.0),
                                 style.word_spacing.unwrap_or(0.0),
-                                clip,
+                                text_clip,
                                 element_clip_mask,
                                 raster_scale,
                             );
@@ -5501,7 +5542,7 @@ fn paint_laid_dom_scrolled(
                                 style.font_family.as_deref(),
                                 style.letter_spacing.unwrap_or(0.0),
                                 style.word_spacing.unwrap_or(0.0),
-                                clip,
+                                text_clip,
                                 element_clip_mask,
                                 raster_scale,
                             );
@@ -6089,7 +6130,61 @@ impl<'a> ScrollPaintState<'a> {
         )
     }
 
+    /// Clipping for a form control's own text and for text inside it. UA
+    /// rendering clips input values, textarea content, and select labels to the
+    /// control's padding box even though the computed `overflow` is visible.
+    fn form_control_text_clip(
+        &self,
+        laid: &crate::DomLayout,
+        id: obscura_dom::tree::NodeId,
+        include_self: bool,
+    ) -> Option<crate::dom::OverflowClip> {
+        let mut current = if include_self {
+            Some(id)
+        } else {
+            crate::dom::rendered_parent(self.tree, id)
+        };
+        while let Some(owner) = current {
+            let is_control = self
+                .tree
+                .with_node(owner, |node| {
+                    node.as_element().is_some_and(|element| {
+                        matches!(element.local.as_ref(), "input" | "textarea" | "select")
+                    })
+                })
+                .unwrap_or(false);
+            if is_control {
+                let (Some(style), Some(rect)) =
+                    (laid.styles.get(&owner), laid.rects.get(&owner))
+                else {
+                    return None;
+                };
+                let (tx, ty) = self.translation_for(laid, owner);
+                return Some(crate::dom::OverflowClip::for_padding_box(
+                    rect, style, tx, ty,
+                ));
+            }
+            current = crate::dom::rendered_parent(self.tree, owner);
+        }
+        None
+    }
+
     fn overflow_clip_for(
+        &self,
+        laid: &crate::DomLayout,
+        id: obscura_dom::tree::NodeId,
+    ) -> Option<crate::dom::OverflowClip> {
+        let inherited = self.overflow_clip_for_base(laid, id);
+        let control = self.form_control_text_clip(laid, id, false);
+        match (inherited, control) {
+            (Some(clip), Some(control)) => Some(clip.intersect(control)),
+            (Some(clip), None) => Some(clip),
+            (None, Some(control)) => Some(control),
+            (None, None) => None,
+        }
+    }
+
+    fn overflow_clip_for_base(
         &self,
         laid: &crate::DomLayout,
         id: obscura_dom::tree::NodeId,
@@ -6199,7 +6294,14 @@ impl<'a> ScrollPaintState<'a> {
         laid: &crate::DomLayout,
         id: obscura_dom::tree::NodeId,
     ) -> Option<crate::dom::OverflowClip> {
-        self.descendant_overflow_clip_for(laid, id)
+        let inherited = self.descendant_overflow_clip_for(laid, id);
+        let control = self.form_control_text_clip(laid, id, true);
+        match (inherited, control) {
+            (Some(clip), Some(control)) => Some(clip.intersect(control)),
+            (Some(clip), None) => Some(clip),
+            (None, Some(control)) => Some(control),
+            (None, None) => None,
+        }
     }
 }
 
@@ -19842,4 +19944,58 @@ mod tests {
         assert!(at_end.layout.styles[&overlay].effectively_invisible);
         assert!(!at_end.has_active_css_animations());
     }
+
+    #[test]
+    fn positioned_computed_insets_report_used_values_not_page_coordinates() {
+        let tree = parse_html(
+            r#"<style>html, body { margin:0 }</style>
+            <div id="outer" style="position:relative;width:1600px;height:900px">
+              <aside id="d" style="position:absolute;top:50px;bottom:0;left:0;width:56px"></aside>
+            </div>"#,
+        );
+        let mut resources = RenderResourceCache::default();
+        let prepared =
+            prepare_dom(&tree, (1600.0, 900.0), None, &mut resources).expect("drawer layout");
+        let d = tree.get_element_by_id("d").unwrap();
+        let computed = prepared.computed_style(d).expect("drawer computed style");
+        assert_eq!(computed["top"], "50px");
+        assert_eq!(computed["left"], "0px");
+        assert_eq!(computed["bottom"], "0px");
+        assert_eq!(computed["right"], "auto");
+        assert_eq!(prepared.layout.rects[&d].height, 850.0);
+    }
+
+    #[test]
+    fn form_control_text_is_clipped_to_its_padding_box() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0;background:white">
+                <input id="tiny" readonly disabled value="Whole country"
+                       style="position:absolute;left:12px;top:20px;width:1px;height:1px;
+                              padding:0;border-width:0;opacity:.6">
+            </body></html>"#,
+        );
+        let mut resources = RenderResourceCache::default();
+        let prepared =
+            prepare_dom(&tree, (260.0, 80.0), None, &mut resources).expect("tiny input layout");
+        let tiny = tree.get_element_by_id("tiny").unwrap();
+        let rect = prepared.layout.rects[&tiny];
+        assert_eq!((rect.width, rect.height), (1.0, 1.0), "{rect:?}");
+        let pixmap = paint_dom(&tree, (260.0, 80.0), None).expect("pixmap");
+        for y in 0..60 {
+            for x in 0..240 {
+                if (rect.x..rect.x + rect.width).contains(&(x as f32))
+                    && (rect.y..rect.y + rect.height).contains(&(y as f32))
+                {
+                    continue;
+                }
+                let pixel = pixmap.pixel(x, y).expect("pixel in bounds");
+                assert!(
+                    pixel.red() > 200 && pixel.green() > 200 && pixel.blue() > 200,
+                    "input value leaked outside its 1x1 content box at ({x}, {y}): {:?}",
+                    (pixel.red(), pixel.green(), pixel.blue())
+                );
+            }
+        }
+    }
+
 }

@@ -220,6 +220,44 @@ impl OverflowClip {
         }
     }
 
+    pub(crate) fn for_padding_box(rect: &Rect, style: &crate::LayoutStyle, tx: f32, ty: f32) -> Self {
+        let left = rect.x + tx + style.border.left;
+        let top = rect.y + ty + style.border.top;
+        let right = (rect.x + tx + rect.width - style.border.right).max(left);
+        let bottom = (rect.y + ty + rect.height - style.border.bottom).max(top);
+        let padding_rect = Rect {
+            x: left,
+            y: top,
+            width: (right - left).max(0.0),
+            height: (bottom - top).max(0.0),
+        };
+        let radii = style
+            .border_model
+            .radii
+            .resolve(rect.width, rect.height)
+            .inset(crate::Sides {
+                top: style.border.top,
+                right: style.border.right,
+                bottom: style.border.bottom,
+                left: style.border.left,
+            });
+        let rounded = (!radii.is_zero()).then(|| {
+            Arc::new(RoundedOverflowClipChain {
+                clip: RoundedOverflowClip {
+                    rect: padding_rect,
+                    radii,
+                },
+                parent: None,
+            })
+        });
+        Self {
+            x: Some((left, right)),
+            y: Some((top, bottom)),
+            rounded,
+            rounded_offset: (0.0, 0.0),
+        }
+    }
+
     pub(crate) fn intersect(self, other: Self) -> Self {
         let axis = |a: Option<(f32, f32)>, b: Option<(f32, f32)>| match (a, b) {
             (Some((a0, a1)), Some((b0, b1))) => {
@@ -2069,6 +2107,76 @@ fn resolve_inline_percentage_heights(
         &mut changed,
     );
     changed
+}
+
+/// Record the used insets of every absolutely positioned box from its final
+/// border-box rect and its CSS containing block. CSSOM exposes these values
+/// for `top`/`right`/`bottom`/`left` (for example `bottom:0` on a stretched
+/// drawer is `0px`, not a page coordinate).
+fn resolve_used_positioned_insets(
+    tree: &DomTree,
+    rects: &HashMap<NodeId, Rect>,
+    styles: &mut HashMap<NodeId, crate::LayoutStyle>,
+    viewport: (f32, f32),
+    initial_cb_width: f32,
+) {
+    let ids: Vec<NodeId> = styles
+        .iter()
+        .filter(|(_, style)| matches!(style.position, Some(taffy::Position::Absolute)))
+        .map(|(&id, _)| id)
+        .collect();
+    for id in ids {
+        let Some(style) = styles.get(&id) else {
+            continue;
+        };
+        let Some(rect) = rects.get(&id).copied() else {
+            continue;
+        };
+        let fixed = style.position_fixed;
+        let mut ancestor = rendered_parent(tree, id);
+        let mut containing_block = None;
+        while let Some(current) = ancestor {
+            if let Some(ancestor_style) = styles.get(&current) {
+                let establishes = ancestor_style.establishes_positioning_containing_block()
+                    || (!fixed && ancestor_style.position.is_some());
+                if establishes {
+                    if let Some(ancestor_rect) = rects.get(&current) {
+                        containing_block = Some((*ancestor_rect, ancestor_style.clone()));
+                    }
+                    break;
+                }
+            }
+            ancestor = rendered_parent(tree, current);
+        }
+        let (cb, cb_style) = containing_block.unwrap_or((
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: initial_cb_width,
+                height: viewport.1,
+            },
+            crate::LayoutStyle::default(),
+        ));
+        let cb_left = cb.x + cb_style.border.left;
+        let cb_top = cb.y + cb_style.border.top;
+        let cb_right = cb.x + cb.width - cb_style.border.right;
+        let cb_bottom = cb.y + cb.height - cb_style.border.bottom;
+        let used = [
+            rect.y - cb_top,
+            cb_right - (rect.x + rect.width),
+            cb_bottom - (rect.y + rect.height),
+            rect.x - cb_left,
+        ];
+        let Some(style) = styles.get_mut(&id) else {
+            continue;
+        };
+        style.used_insets = [None; 4];
+        for index in 0..4 {
+            if style.inset[index].is_some() || style.inset_expressions[index].is_some() {
+                style.used_insets[index] = Some(used[index]);
+            }
+        }
+    }
 }
 
 fn sync_positioned_pseudo_percentage_padding(
@@ -5309,6 +5417,7 @@ fn layout_dom_once(
     // engine item index (they have no DOM id to key `rects` by).
     let mut anon_rects: HashMap<usize, Rect> = HashMap::new();
     let mut generated_rects: Vec<Option<Rect>> = Vec::new();
+    let mut initial_cb_width_for_insets = viewport.0;
     if let Some(root_id) = root {
         // Headless Chromium's classic scrollbar gutter is 15 CSS pixels.
         // `scrollbar-gutter:stable` reserves it even when the scrollbar track
@@ -5321,6 +5430,7 @@ fn layout_dom_once(
             .map_or(0, |style| style.scrollbar_gutters.min(2));
         let initial_cb_width =
             (viewport.0 - CLASSIC_SCROLLBAR_GUTTER * f32::from(root_gutters)).max(0.0);
+        initial_cb_width_for_insets = initial_cb_width;
         let initial_cb_x = if root_gutters == 2 {
             CLASSIC_SCROLLBAR_GUTTER
         } else {
@@ -5996,6 +6106,38 @@ fn layout_dom_once(
                 for i in style.inset.iter_mut() {
                     if let Some(d) = i {
                         *i = Some(d.resolve(em_px, root_fs, vw, vh));
+                    }
+                }
+                // CSS2 10.6.4: an absolutely positioned box whose height is
+                // auto and whose top and bottom insets are both non-auto has a
+                // definite used height. Descendant percentage heights resolve
+                // against its content box, so record that basis now instead of
+                // treating the box as an indefinite containing block and
+                // collapsing `height:100%` children to zero.
+                if !style.position_fixed
+                    && matches!(style.position, Some(taffy::Position::Absolute))
+                    && style.height == crate::Dimension::Auto
+                {
+                    if let (
+                        Some(crate::Dimension::Px(top)),
+                        Some(crate::Dimension::Px(bottom)),
+                    ) = (style.inset[0], style.inset[2])
+                    {
+                        let border_box_height = (inh.positioning_cb_height
+                            - top
+                            - bottom
+                            - style.margin.top
+                            - style.margin.bottom)
+                            .max(0.0);
+                        child_cb_height = (border_box_height
+                            - style.padding.top
+                            - style.padding.bottom
+                            - style.border.top
+                            - style.border.bottom)
+                            .max(0.0);
+                        child_cb_height_definite = true;
+                        child_cb_height_deferred = false;
+                        definite_height_nodes.insert(id);
                     }
                 }
                 // A fixed box is positioned against the initial containing
@@ -7755,6 +7897,13 @@ fn layout_dom_once(
         }
     }
     sync_positioned_pseudo_percentage_padding(&rects, &mut styles);
+    resolve_used_positioned_insets(
+        tree,
+        &rects,
+        &mut styles,
+        viewport,
+        initial_cb_width_for_insets,
+    );
 
     let mut clip_rects = HashMap::new();
     let mut translates = HashMap::new();
