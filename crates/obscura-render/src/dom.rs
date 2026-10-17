@@ -5433,6 +5433,13 @@ fn layout_dom_once(
             /// A definite post-flexing height whose numeric basis is only
             /// available during layout. Keep descendant percentages intact.
             cb_height_deferred: bool,
+            /// Padding-box width of the nearest ancestor that establishes a
+            /// positioning containing block. Percentage insets on an
+            /// absolutely positioned box resolve against this box, not
+            /// against the direct parent's content box.
+            positioning_cb_width: f32,
+            /// Padding-box height for the same positioning containing block.
+            positioning_cb_height: f32,
         }
         impl Default for Inherited {
             fn default() -> Self {
@@ -5483,6 +5490,8 @@ fn layout_dom_once(
                     cb_height: 0.0,
                     cb_height_definite: false,
                     cb_height_deferred: false,
+                    positioning_cb_width: 0.0,
+                    positioning_cb_height: 0.0,
                 }
             }
         }
@@ -5519,6 +5528,8 @@ fn layout_dom_once(
         root_inh.cb_width = initial_cb_width;
         root_inh.cb_height = viewport.1;
         root_inh.cb_height_definite = true;
+        root_inh.positioning_cb_width = initial_cb_width;
+        root_inh.positioning_cb_height = viewport.1;
         // This set records computed definiteness after walking the real
         // containing-block chain. Merely retaining `height:Percent` is not
         // sufficient: under an auto-height containing block it computes to
@@ -5531,6 +5542,8 @@ fn layout_dom_once(
             let mut child_cb_width = inh.cb_width;
             let mut child_cb_height = inh.cb_height;
             let mut child_cb_height_definite = false;
+            let mut child_positioning_cb_width = inh.positioning_cb_width;
+            let mut child_positioning_cb_height = inh.positioning_cb_height;
             let mut child_cb_height_deferred =
                 (inh.cb_height_definite || inh.cb_height_deferred)
                     && styles.get(&id).is_some_and(|style| {
@@ -5698,11 +5711,25 @@ fn layout_dom_once(
                             - style.border.right)
                             .max(0.0)
                     };
+                    if style.position.is_some()
+                        || style.establishes_positioning_containing_block()
+                    {
+                        child_positioning_cb_width = (child_cb_width
+                            + style.padding.left
+                            + style.padding.right)
+                            .max(0.0);
+                        child_positioning_cb_height = (child_cb_height
+                            + style.padding.top
+                            + style.padding.bottom)
+                            .max(0.0);
+                    }
                 }
                 inh.cb_width = child_cb_width;
                 inh.cb_height = child_cb_height;
                 inh.cb_height_definite = child_cb_height_definite;
                 inh.cb_height_deferred = child_cb_height_deferred;
+                inh.positioning_cb_width = child_positioning_cb_width;
+                inh.positioning_cb_height = child_positioning_cb_height;
                 for child in style_children(tree, id).into_iter().rev() {
                     queue.push((child, inh.clone()));
                 }
@@ -5981,10 +6008,26 @@ fn layout_dom_once(
                     let Some(expression) = style.inset_expressions[index].as_deref() else {
                         continue;
                     };
-                    let percent_base = if matches!(index, 1 | 3) {
-                        cb_w
+                    // Functional percentage insets follow the CSS
+                    // containing-block rules. An absolutely positioned box
+                    // uses the nearest positioned ancestor's padding box;
+                    // a fixed box uses the viewport. The old code used the
+                    // direct parent's content width and the viewport height
+                    // for every box, so calc(100%) could land outside the
+                    // positioned ancestor entirely.
+                    let (inset_cb_width, inset_cb_height) = if style.position_fixed {
+                        (initial_cb_width, viewport.1)
+                    } else if matches!(style.position, Some(taffy::Position::Absolute)) {
+                        (inh.positioning_cb_width, inh.positioning_cb_height)
+                    } else if inh.cb_height_definite {
+                        (cb_w, inh.cb_height)
                     } else {
-                        viewport.1
+                        (cb_w, viewport.1)
+                    };
+                    let percent_base = if matches!(index, 1 | 3) {
+                        inset_cb_width
+                    } else {
+                        inset_cb_height
                     };
                     style.inset[index] = crate::style::resolve_contextual_length(
                         expression,
@@ -6525,11 +6568,21 @@ fn layout_dom_once(
                             .max(0.0)
                     };
                 }
+                if style.position.is_some()
+                    || style.establishes_positioning_containing_block()
+                {
+                    child_positioning_cb_width =
+                        (child_cb_width + style.padding.left + style.padding.right).max(0.0);
+                    child_positioning_cb_height =
+                        (child_cb_height + style.padding.top + style.padding.bottom).max(0.0);
+                }
             }
             inh.cb_width = child_cb_width;
             inh.cb_height = child_cb_height;
             inh.cb_height_definite = child_cb_height_definite;
             inh.cb_height_deferred = child_cb_height_deferred;
+            inh.positioning_cb_width = child_positioning_cb_width;
+            inh.positioning_cb_height = child_positioning_cb_height;
             for child in style_children(tree, id).into_iter().rev() {
                 queue.push((child, inh.clone()));
             }
@@ -6880,10 +6933,7 @@ fn layout_dom_once(
                     crate::Dimension::Px(value) | crate::Dimension::Percent(value)
                         if value == 0.0
                 );
-                if zero_basis
-                    && style.height == crate::Dimension::Auto
-                    && style.min_height == crate::Dimension::Auto
-                {
+                if zero_basis && style.height == crate::Dimension::Auto {
                     style.flex_basis = crate::Dimension::Auto;
                 }
             }
