@@ -4060,6 +4060,8 @@ fn scale_number(s: &str) -> Option<f32> {
 #[derive(Debug)]
 pub(crate) struct GridCalcExpression {
     expression: String,
+    /// Insets may be negative; grid track sizes may not.
+    allow_negative: bool,
     em_px: std::sync::atomic::AtomicU32,
     rem_px: std::sync::atomic::AtomicU32,
     vw: std::sync::atomic::AtomicU32,
@@ -4069,6 +4071,14 @@ pub(crate) struct GridCalcExpression {
 
 impl GridCalcExpression {
     fn parse(value: &str) -> Option<Self> {
+        Self::parse_with_sign(value, false)
+    }
+
+    fn parse_inset(value: &str) -> Option<Self> {
+        Self::parse_with_sign(value, true)
+    }
+
+    fn parse_with_sign(value: &str, allow_negative: bool) -> Option<Self> {
         let value = value.trim().to_ascii_lowercase();
         if !(value.starts_with("calc(")
             || value.starts_with("min(")
@@ -4128,6 +4138,7 @@ impl GridCalcExpression {
         }
         Some(Self {
             expression: value,
+            allow_negative,
             em_px: std::sync::atomic::AtomicU32::new(16.0f32.to_bits()),
             rem_px: std::sync::atomic::AtomicU32::new(16.0f32.to_bits()),
             vw: std::sync::atomic::AtomicU32::new(0.0f32.to_bits()),
@@ -4164,9 +4175,12 @@ pub(crate) fn set_grid_calc_context(
     for expression in style.grid_calc_expressions.iter().flatten() {
         expression.set_context(em_px, rem_px, vw, vh);
     }
+    for expression in style.inset_calc_expressions.iter().flatten() {
+        expression.set_context(em_px, rem_px, vw, vh);
+    }
 }
 
-/// Resolve an Arc-backed grid calc handle installed in Taffy.
+/// Resolve an Arc-backed grid or inset calc handle installed in Taffy.
 ///
 /// # Safety
 ///
@@ -4175,10 +4189,10 @@ pub(crate) fn set_grid_calc_context(
 #[allow(unsafe_code)]
 pub(crate) fn resolve_grid_calc(value: *const (), basis: f32) -> f32 {
     // SAFETY: upheld by `new_taffy_tree` and the Arc ownership documented on
-    // `LayoutStyle::grid_calc_expressions`.
+    // `LayoutStyle::grid_calc_expressions` and `inset_calc_expressions`.
     let calc = unsafe { &*value.cast::<GridCalcExpression>() };
     use std::sync::atomic::Ordering;
-    resolve_contextual_length(
+    let resolved = resolve_contextual_length(
         &calc.expression,
         f32::from_bits(calc.em_px.load(Ordering::Relaxed)),
         f32::from_bits(calc.rem_px.load(Ordering::Relaxed)),
@@ -4186,9 +4200,13 @@ pub(crate) fn resolve_grid_calc(value: *const (), basis: f32) -> f32 {
         f32::from_bits(calc.vh.load(Ordering::Relaxed)),
         basis,
     )
-        .filter(|value| value.is_finite())
-        .unwrap_or(0.0)
-        .max(0.0)
+    .filter(|value| value.is_finite())
+    .unwrap_or(0.0);
+    if calc.allow_negative {
+        resolved
+    } else {
+        resolved.max(0.0)
+    }
 }
 
 /// Parse a track list into taffy sizing functions plus the `[line-name]` map
@@ -7018,10 +7036,13 @@ fn set_inset_side(style: &mut LayoutStyle, index: usize, value: &str) {
     let value = value.trim();
     if let Some(expression) = deferred_length_expression(value) {
         style.inset[index] = None;
+        style.inset_calc_expressions[index] = GridCalcExpression::parse_inset(&expression)
+            .map(std::sync::Arc::new);
         style.inset_expressions[index] = Some(expression);
     } else {
         let inset = inset_dim(value);
         style.inset[index] = inset;
+        style.inset_calc_expressions[index] = None;
         style.inset_expressions[index] = inset
             .filter(|dimension| {
                 matches!(
