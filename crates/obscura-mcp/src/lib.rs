@@ -735,7 +735,7 @@ fn handle_tools_list(id: Value) -> RpcResponse {
         tools.extend([
             json!({
                 "name": "browser_screenshot",
-                "description": "Capture the current rendered viewport as a PNG image. Width and height default to the page's current CSS viewport.",
+                "description": "Capture the current rendered viewport as a PNG image. Width and height default to the page's current CSS viewport; a different size resizes the page viewport first (fires resize and ResizeObserver) and the new size persists.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -921,6 +921,21 @@ async fn tool_screenshot(args: &Value, state: &mut BrowserState) -> Result<Value
         optional_number(args, "height")?.unwrap_or(current.1),
     );
     validate_screenshot_viewport(viewport)?;
+
+    // A size that differs from the page's viewport resizes the page first, as
+    // Playwright's setViewportSize does. Capturing at a size the page never
+    // saw lays out CSS at one width while script-sized content (canvas maps,
+    // charts, innerWidth-driven layouts) stays at the old one.
+    if viewport != current {
+        state.page_mut().set_viewport(viewport);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1_500);
+        while std::time::Instant::now() < deadline {
+            match state.advance_active_page_tasks().await {
+                Ok(false) => tokio::time::sleep(std::time::Duration::from_millis(16)).await,
+                _ => break,
+            }
+        }
+    }
 
     let page = state.page_mut();
     let _ = page.prepare_screenshot_resources(1_000).await;
@@ -3162,6 +3177,29 @@ mod tests {
             assert!(tool["inputSchema"]["properties"].is_object());
             assert!(tool["inputSchema"]["properties"].get("properties").is_none());
         }
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn screenshot_at_a_new_size_resizes_the_page_viewport_first() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate(
+            "data:text/html,<body><script>window.resizes=[];addEventListener('resize',()=>resizes.push(innerWidth+'x'+innerHeight))</script></body>",
+        ).await.expect("test page should navigate");
+        state.page_mut().set_viewport((320.0, 240.0));
+        let _ = state.advance_active_page_tasks().await;
+        let _ = state.page_mut().evaluate("window.resizes.length = 0");
+
+        let screenshot = handle_tool_call(
+            json!(1),
+            &json!({ "name": "browser_screenshot", "arguments": { "width": 200, "height": 100 } }),
+            &mut state,
+        ).await.result.expect("screenshot response");
+        assert_eq!(screenshot["content"][0]["type"], "image");
+        assert_eq!(state.page_mut().viewport, (200.0, 100.0));
+        let seen = state.page_mut().evaluate("JSON.stringify([innerWidth, innerHeight, resizes])");
+        assert_eq!(seen, json!("[200,100,[\"200x100\"]]"),
+            "script must observe the captured size and one resize event");
     }
 
     #[cfg(feature = "render")]

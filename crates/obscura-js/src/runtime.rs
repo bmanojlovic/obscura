@@ -1608,7 +1608,9 @@ impl ObscuraJsRuntime {
         let _ = self.execute_runtime_script(
             "<set-viewport>",
             format!(
-                "globalThis.__obscura_viewport_w={width};\
+                "{{const resized=globalThis.__obscura_viewport_w!==undefined\
+                   &&(globalThis.innerWidth!=={width}||globalThis.innerHeight!=={height});\
+                 globalThis.__obscura_viewport_w={width};\
                  globalThis.__obscura_viewport_h={height};\
                  globalThis.innerWidth={width};globalThis.innerHeight={height};\
                  globalThis.__obscura_recompute_media_queries();\
@@ -1621,7 +1623,10 @@ impl ObscuraJsRuntime {
                  }}\
                  if(typeof globalThis.__obscura_recompute_resizes==='function'){{\
                    globalThis.__obscura_recompute_resizes();\
-                 }}",
+                 }}\
+                 if(resized&&typeof globalThis.dispatchEvent==='function'){{\
+                   setTimeout(function(){{globalThis.dispatchEvent(new Event('resize'));}},0);\
+                 }}}}",
             ),
         );
     }
@@ -11528,6 +11533,25 @@ mod tests {
     }
 
     #[test]
+    fn font_face_set_includes_origin_clean_linked_stylesheet_faces() {
+        let mut rt = setup_runtime("<html><head><link id='same' rel='stylesheet' href='/icons.css'>\
+            <link id='cross' rel='stylesheet' href='https://fonts.test/css'></head><body></body></html>");
+        {
+            let state = rt.state.borrow();
+            let dom = state.dom.as_ref().unwrap();
+            let same = dom.get_element_by_id("same").unwrap();
+            let cross = dom.get_element_by_id("cross").unwrap();
+            assert!(dom.replace_external_stylesheet(same,
+                "@font-face{font-family:'Material Icons';src:url(http://example.com/mi.woff2) format('woff2')}".into(), true));
+            assert!(dom.replace_external_stylesheet(cross,
+                "@font-face{font-family:Hidden;src:url(https://fonts.test/hidden.woff2)}".into(), false));
+        }
+        let families = rt.evaluate("JSON.stringify(Array.from(document.fonts, face => face.family))").unwrap();
+        assert_eq!(families.as_str(), Some(r#"["Material Icons"]"#),
+            "a same-origin linked sheet contributes its faces; cross-origin bytes stay opaque to script");
+    }
+
+    #[test]
     fn font_face_set_tracks_authored_and_script_created_faces() {
         let mut rt = setup_runtime(
             r#"<html><head><style>
@@ -18195,6 +18219,49 @@ mod tests {
             obscura_render::RenderResourceCache::with_loader(loader);
         rt.run_page_init();
         rt
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn canvas_draw_image_and_image_bitmap_read_loaded_image_pixels() {
+        use base64::Engine as _;
+        // 2x1: opaque red, then blue at alpha 128.
+        let png = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAADklEQVR4nGP4z8AAQg0AD3oDfnfpf5cAAAAASUVORK5CYII=")
+            .unwrap();
+        let mut rt = parser_image_runtime(
+            r#"<canvas id="c" width="4" height="2"></canvas><canvas id="d" width="2" height="1"></canvas>"#,
+            move |_url: &str| Some(png.clone()),
+        );
+        rt.execute_script("draw-image", r#"
+            globalThis.__out = null;
+            const img = new Image();
+            img.crossOrigin = "anonymous";
+            img.onload = async () => {
+                const ctx = document.getElementById("c").getContext("2d");
+                ctx.drawImage(img, 0, 0, 4, 2);
+                const scaled = Array.from(ctx.getImageData(0, 0, 4, 1).data);
+                const bitmap = await createImageBitmap(img);
+                const crop = await createImageBitmap(img, 1, 0, 1, 1);
+                const d = document.getElementById("d").getContext("2d");
+                d.drawImage(bitmap, 0, 0);
+                d.drawImage(crop, 0, 0);
+                __out = [scaled, [bitmap.width, bitmap.height], [crop.width, crop.height],
+                    Array.from(d.getImageData(0, 0, 2, 1).data)];
+            };
+            img.src = "http://example.com/tile.png";
+        "#).unwrap();
+        rt.run_event_loop_bounded(200).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__out").unwrap(),
+            serde_json::json!([
+                [255, 0, 0, 255, 255, 0, 0, 255, 0, 0, 255, 128, 0, 0, 255, 128],
+                [2, 1],
+                [1, 1],
+                // The cropped blue pixel composites over the opaque red one.
+                [127, 0, 128, 255, 0, 0, 255, 128]
+            ])
+        );
     }
 
     #[cfg(feature = "render")]

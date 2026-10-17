@@ -485,6 +485,32 @@ impl RenderResourceCache {
         }
     }
 
+    /// Cache-only decoded pixels of one `<img>` for use as a Canvas 2D image
+    /// source (`drawImage`, `createImageBitmap`). Returns straight-alpha RGBA
+    /// at the resource's natural pixel size. Never opens a request: callers
+    /// only ask once the element reports a completed load.
+    pub fn cached_image_element_rgba(
+        &self,
+        tree: &DomTree,
+        id: obscura_dom::tree::NodeId,
+        viewport: (f32, f32),
+        base_url: Option<&str>,
+    ) -> Option<(u32, u32, Vec<u8>)> {
+        let (src, _) = resolve_img_url(tree, id, viewport)?;
+        let resolved_url = resolve_resource_url(&src, base_url)?;
+        let bytes = if resolved_url.starts_with("data:") {
+            let mut scratch = RenderResourceCache::with_loader_and_limits(|_url: &str| None, 0, 0);
+            fetch_bytes(&resolved_url, None, &mut scratch)?
+        } else {
+            let key = image_resource_key(&resolved_url, image_request_profile(tree, id));
+            match self.entries.get(&key) {
+                Some(CachedResource::Bytes { bytes, .. }) => Arc::clone(bytes),
+                _ => return None,
+            }
+        };
+        decode_canvas_image_source(&bytes)
+    }
+
     /// Cache-only poster selection for one live `<video>`. Poster images use
     /// the element's media CORS settings and the same page-owned image cache as
     /// ordinary replaced images; they do not imply that any video frame has
@@ -7756,32 +7782,58 @@ fn collect_web_fonts(
     let mut fonts = Vec::new();
     let mut rules = Vec::new();
 
+    // Host-fetched sheets (`<link rel=stylesheet>` and inline `@import`) live
+    // outside the DOM text, keyed by their owner element. Their `url()`s are
+    // already rebased to the sheet URL, so the document base still applies.
+    let external = tree.external_stylesheets();
     for nid in crate::dom::rendered_descendants(tree, tree.document()) {
         // Inspect tags without copying unrelated script/text payloads.
-        if !tree.with_node(nid, |node| {
-            node.as_element().is_some_and(|element| element.local.as_ref() == "style")
-        }).unwrap_or(false) {
+        let Some((is_style, is_linked_sheet)) = tree.with_node(nid, |node| {
+            let element = node.as_element()?;
+            let local = element.local.as_ref();
+            let linked = local == "link"
+                && node.get_attribute("disabled").is_none()
+                && node.get_attribute("rel").is_some_and(|rel| {
+                    rel.split_ascii_whitespace()
+                        .any(|part| part.eq_ignore_ascii_case("stylesheet"))
+                });
+            Some((local == "style", linked))
+        }).flatten() else {
+            continue;
+        };
+        if !is_style && !is_linked_sheet {
             continue;
         }
-        let css = tree.text_content(nid);
-        for face in font_face_blocks(&css) {
-            if !font_face_covers_ascii(face) {
-                continue;
+        let mut sheets: Vec<Arc<str>> = Vec::new();
+        if let Some(sheet) = external.get(&nid) {
+            sheets.extend(sheet.sources.iter().cloned());
+            if let Some(rules) = &sheet.cssom_rules {
+                sheets.extend(rules.iter().cloned());
             }
-            let sources: Vec<_> = font_face_urls(face)
-                .into_iter()
-                .filter(|src| font_source_may_be_supported(src))
-                .map(|src| (font_resource_key(&src, base_url), src))
-                .collect();
-            if sources.is_empty() {
-                continue;
+        }
+        if is_style {
+            sheets.push(Arc::from(tree.text_content(nid)));
+        }
+        for css in &sheets {
+            for face in font_face_blocks(css.as_ref()) {
+                if !font_face_covers_ascii(face) {
+                    continue;
+                }
+                let sources: Vec<_> = font_face_urls(face)
+                    .into_iter()
+                    .filter(|src| font_source_may_be_supported(src))
+                    .map(|src| (font_resource_key(&src, base_url), src))
+                    .collect();
+                if sources.is_empty() {
+                    continue;
+                }
+                rules.push(FontRule {
+                    sources,
+                    family: font_face_family(face),
+                    weight: font_face_weight(face),
+                    italic: font_face_italic(face),
+                });
             }
-            rules.push(FontRule {
-                sources,
-                family: font_face_family(face),
-                weight: font_face_weight(face),
-                italic: font_face_italic(face),
-            });
         }
     }
     for face in dynamic_fonts {
@@ -8287,6 +8339,19 @@ fn static_raster_cacheable(bytes: &[u8]) -> bool {
             .ok().and_then(|decoder| decoder.is_apng().ok()) == Some(false),
         _ => false,
     }
+}
+
+/// Decode raster bytes for a Canvas 2D image source. Canvas buffers are
+/// straight-alpha RGBA, so no premultiplication. Oversized images are refused
+/// rather than downscaled: drawImage source rectangles are in natural pixels.
+fn decode_canvas_image_source(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    const MAX_CANVAS_SOURCE_PIXELS: u64 = 16 * 1024 * 1024;
+    let decoded = image::load_from_memory(bytes).ok()?;
+    let (width, height) = (decoded.width(), decoded.height());
+    if width == 0 || height == 0 || width as u64 * height as u64 > MAX_CANVAS_SOURCE_PIXELS {
+        return None;
+    }
+    Some((width, height, decoded.to_rgba8().into_raw()))
 }
 
 /// Decode raster image bytes (GIF/JPEG/PNG/WebP) to a premultiplied-alpha pixmap
@@ -18022,6 +18087,28 @@ mod tests {
         assert_eq!(*loads.lock().unwrap(), vec![
             "https://example.test/second.ttf", "https://example.test/first.ttf",
             "https://example.test/shadow.ttf"], "warm resources must not reload or discover unslotted fonts");
+    }
+
+    #[test]
+    fn web_fonts_include_faces_from_host_fetched_stylesheets() {
+        let tree = parse_html(r#"<link id=sheet rel="StyleSheet" href="https://fonts.test/css">
+            <link id=off rel=stylesheet disabled href="https://fonts.test/off.css">
+            <style id=imp>@import url(https://fonts.test/imported.css);</style>"#);
+        let sheet = tree.get_element_by_id("sheet").unwrap();
+        let off = tree.get_element_by_id("off").unwrap();
+        let imp = tree.get_element_by_id("imp").unwrap();
+        assert!(tree.replace_external_stylesheet(sheet,
+            "@font-face{font-family:'Material Icons';src:url(https://fonts.test/mi.woff2) format('woff2')}".into(), false));
+        assert!(tree.replace_external_stylesheet(off,
+            "@font-face{font-family:Disabled;src:url(https://fonts.test/off.ttf)}".into(), true));
+        assert!(tree.append_external_stylesheet(imp,
+            "@font-face{font-family:Imported;src:url(https://fonts.test/imported.ttf)}".into(), true));
+        let mut resources = RenderResourceCache::with_loader(|_: &str| Some(SERIF_FONT_BYTES.to_vec()));
+        let fonts = collect_web_fonts(&tree, Some("https://example.test/page"), &mut resources, &[]);
+        let mut families = fonts.iter().map(|f| f.family.as_deref().unwrap()).collect::<Vec<_>>();
+        families.sort_unstable();
+        assert_eq!(families, vec!["Imported", "Material Icons"],
+            "linked and @import sheets register their faces; a disabled link does not");
     }
 
     #[test]
