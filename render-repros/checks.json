@@ -14,6 +14,26 @@
   "emulated-color-scheme": [
     {"name": "default light preference keeps the green block", "color": "#00aa00", "x": 0, "y": 0, "width": 240, "height": 100}
   ],
+  "absolute-calc-shrink-to-fit": [
+    {"name": "calc percentage uses the real 28px shrink-to-fit containing block", "color": "#087f5b", "x": 39, "y": 53, "width": 100, "height": 60}
+  ],
+  "absolute-top-bottom-percent-height": [
+    {"name": "top item paints inside the stretched drawer", "color": "#1971c2", "x": 0, "y": 50, "width": 56, "height": 36},
+    {"name": "bottom item paints after the percentage height resolves", "color": "#e8590c", "x": 0, "y": 800, "width": 56, "height": 40}
+  ],
+  "form-control-text-clip": [
+    {"name": "fixture marker", "color": "#1971c2", "x": 270, "y": 0, "width": 20, "height": 20},
+    {"name": "input value is clipped to its 1x1 content box", "color": "#c00000", "count": 0}
+  ],
+  "absolute-calc-insets": [
+    {"name": "calc start inset uses positioned ancestor padding box", "color": "#087f5b", "x": 279, "y": 149, "width": 20, "height": 20},
+    {"name": "plain percentage insets use positioned ancestor padding box", "color": "#1971c2", "x": 155, "y": 85, "width": 20, "height": 20},
+    {"name": "calc end insets use positioned ancestor padding box", "color": "#e8590c", "x": 19, "y": 9, "width": 20, "height": 20}
+  ],
+  "flex-indefinite-basis": [
+    {"name": "zero basis uses content height under an indefinite column", "color": "#1971c2", "x": 40, "y": 44, "width": 280, "height": 120},
+    {"name": "header keeps its fixed height", "color": "#e8590c", "x": 40, "y": 20, "width": 280, "height": 24}
+  ],
   "retained-cssom-raster": [
     {"name": "CSSOM width and fill survive metadata update", "color": "#246840", "x": 16, "y": 16, "width": 128, "height": 32},
     {"name": "updated image and animation callback complete", "color": "#246840", "x": 16, "y": 220, "width": 32, "height": 16},

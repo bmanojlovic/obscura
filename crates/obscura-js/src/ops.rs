@@ -7880,6 +7880,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_canvas_register_surface());
         ops.push(op_canvas_paint_damage());
         ops.push(op_image_metadata());
+        ops.push(op_image_element_pixels());
         ops.push(op_load_image_metadata());
         ops.push(op_layout_geometry());
         ops.push(op_layout_box_metrics());
@@ -8531,6 +8532,42 @@ fn op_image_metadata(state: &OpState, nid: u32, _cached_only: bool) -> String {
         return serde_json::json!({ "ok": false, "currentSrc": "" }).to_string();
     }
     cached_image_metadata_for_node(&gs, node_id)
+}
+
+/// Decoded pixels of a completed `<img>` for Canvas 2D `drawImage` and
+/// `createImageBitmap`. Cache-only, like `op_image_metadata`: the element's
+/// load already seeded the renderer cache. The result is an 8-byte header
+/// (width, height as little-endian u32) followed by straight-alpha RGBA, or
+/// empty when no decodable bytes are cached.
+#[cfg(feature = "render")]
+#[op2]
+#[buffer]
+fn op_image_element_pixels(state: &OpState, nid: u32) -> Vec<u8> {
+    let shared = state.borrow::<SharedState>().clone();
+    let gs = shared.borrow();
+    let node_id = NodeId::new(nid);
+    let Some(dom) = gs.dom.as_ref() else { return Vec::new() };
+    let is_image = dom.get_node(node_id).is_some_and(|node| {
+        node.as_element()
+            .is_some_and(|element| element.local.as_ref() == "img")
+    });
+    if !is_image {
+        return Vec::new();
+    }
+    let base_url = document_base_url(&gs);
+    let Some((width, height, rgba)) = gs.render_resources.cached_image_element_rgba(
+        dom,
+        node_id,
+        gs.viewport,
+        base_url.as_deref(),
+    ) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(8 + rgba.len());
+    out.extend_from_slice(&width.to_le_bytes());
+    out.extend_from_slice(&height.to_le_bytes());
+    out.extend_from_slice(&rgba);
+    out
 }
 
 /// Compatibility path for standalone render runtimes which deliberately

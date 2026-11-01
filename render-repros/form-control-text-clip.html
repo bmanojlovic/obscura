@@ -1,0 +1,30 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>form control text clips to its padding box</title>
+  <style>
+    html, body { margin: 0; background: #fff; }
+    #label { display: block; position: relative; width: 260px; height: 40px; }
+    #focus {
+      position: absolute; left: 12px; top: 20px; width: 1px; height: 1px;
+      padding: 0; border-width: 0; color: #c00000; opacity: 1;
+    }
+    #marker { position: absolute; left: 270px; top: 0; width: 20px; height: 20px; background: #1971c2; }
+  </style>
+</head>
+<body>
+  <label id="label">
+    <span>Whole country</span>
+    <input id="focus" readonly disabled value="Whole country">
+    <i id="marker"></i>
+  </label>
+  <script>
+    window.__boxes = {};
+    for (const id of ['label', 'focus', 'marker']) {
+      const r = document.getElementById(id).getBoundingClientRect();
+      window.__boxes[id] = [r.x, r.y, r.width, r.height];
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,35 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>absolute calc inset under shrink-to-fit</title>
+  <style>
+    html, body { margin: 0; background: #fff; }
+    #outer { position: relative; width: 800px; height: 300px; }
+    #wrapper { position: absolute; left: 7px; top: 53px; }
+    #cb { position: relative; }
+    #button { display: block; width: 28px; height: 28px; padding: 0; border: 0; }
+    #p {
+      position: absolute; left: calc(100% + 4px); top: 0;
+      width: 100px; height: 60px; background: #087f5b;
+    }
+  </style>
+</head>
+<body>
+  <div id="outer">
+    <div id="wrapper">
+      <div id="cb">
+        <button id="button"></button>
+        <div id="p"></div>
+      </div>
+    </div>
+  </div>
+  <script>
+    window.__boxes = {};
+    for (const id of ['cb', 'p']) {
+      const r = document.getElementById(id).getBoundingClientRect();
+      window.__boxes[id] = [r.x, r.y, r.width, r.height];
+    }
+  </script>
+</body>
+</html>

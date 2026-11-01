@@ -1,0 +1,30 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>flex indefinite basis</title>
+  <style>
+    html, body { margin: 0; background: #fff; }
+    #container {
+      display: flex; flex-direction: column; width: 280px; max-height: 300px;
+      margin: 20px 0 0 40px;
+    }
+    #header { height: 24px; background: #e8590c; }
+    #body { flex: 1; min-height: 0; overflow-y: auto; background: #1971c2; }
+    #body > div { height: 40px; }
+  </style>
+</head>
+<body>
+  <div id="container">
+    <div id="header"></div>
+    <div id="body"><div></div><div></div><div></div></div>
+  </div>
+  <script>
+    window.__boxes = {};
+    for (const id of ['container', 'header', 'body']) {
+      const r = document.getElementById(id).getBoundingClientRect();
+      window.__boxes[id] = [r.x, r.y, r.width, r.height];
+    }
+  </script>
+</body>
+</html>

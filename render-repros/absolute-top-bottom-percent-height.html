@@ -1,0 +1,35 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>percentage height inside an absolute top+bottom box</title>
+  <style>
+    html, body { margin: 0; background: #fff; }
+    #outer { position: relative; width: 900px; height: 850px; }
+    #d { position: absolute; top: 50px; bottom: 0; left: 0; width: 56px; }
+    #c { width: 100%; height: 100%; overflow: auto; }
+    #inner { position: relative; width: 100%; height: 100%; overflow: hidden; }
+    #top-item { position: absolute; top: 0; left: 0; right: 0; height: 36px; background: #1971c2; }
+    #bottom-item { position: absolute; top: 750px; left: 0; right: 0; height: 40px; background: #e8590c; }
+  </style>
+</head>
+<body>
+  <div id="outer">
+    <aside id="d">
+      <div id="c">
+        <div id="inner">
+          <div id="top-item"></div>
+          <div id="bottom-item"></div>
+        </div>
+      </div>
+    </aside>
+  </div>
+  <script>
+    window.__boxes = {};
+    for (const id of ['d', 'c', 'inner', 'top-item', 'bottom-item']) {
+      const r = document.getElementById(id).getBoundingClientRect();
+      window.__boxes[id] = [r.x, r.y, r.width, r.height];
+    }
+  </script>
+</body>
+</html>

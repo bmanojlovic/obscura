@@ -5009,3 +5009,147 @@ fn float_ending_at_rounded_segment_boundary_does_not_panic() {
 
     assert_eq!(place(&mut context, 400.3333, FloatDirection::Left).y, 1859.0);
 }
+
+#[test]
+fn absolute_calc_insets_resolve_against_the_positioned_ancestor_padding_box() {
+    // A functional percentage inset must use the nearest positioned
+    // ancestor's padding box, not the direct parent's content box and not the
+    // viewport. The static wrapper makes the two boxes very different, and the
+    // padding on the positioned ancestor checks that padding is included.
+    let tree = parse_html(
+        r#"<style>
+            html, body { margin:0 }
+            #cb { position:relative; width:200px; height:100px; margin:20px 0 0 30px;
+                  padding:10px 20px; border:5px solid }
+            #static { width:50px; height:30px; margin:7px; padding:3px }
+            .box { position:absolute; width:10px; height:10px }
+        </style>
+        <div id="cb"><div id="static">
+            <div id="start" class="box" style="left:calc(100% + 4px); top:calc(100% + 4px)"></div>
+            <div id="end" class="box" style="right:calc(100% - 4px); bottom:calc(100% - 4px)"></div>
+            <div id="half" class="box" style="left:50%; top:50%"></div>
+            <div id="full" class="box" style="left:100%; top:0"></div>
+        </div></div>"#,
+    );
+    let layout = layout_dom(&tree, (800.0, 400.0));
+    let rect = |id: &str| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let cb = rect("cb");
+    // Border box x=30, border=5, so the padding box starts at x=35. Its width
+    // is the 200px content width plus 40px of horizontal padding.
+    let origin_x = cb.x + 5.0;
+    let origin_y = cb.y + 5.0;
+    let padding_width = 240.0;
+    let padding_height = 120.0;
+
+    let start = rect("start");
+    assert_eq!(start.x, origin_x + padding_width + 4.0, "{start:?}");
+    assert_eq!(start.y, origin_y + padding_height + 4.0, "{start:?}");
+
+    let end = rect("end");
+    assert_eq!(end.x + end.width, origin_x + 4.0, "{end:?}");
+    assert_eq!(end.y + end.height, origin_y + 4.0, "{end:?}");
+
+    let half = rect("half");
+    assert_eq!(half.x, origin_x + padding_width / 2.0, "{half:?}");
+    assert_eq!(half.y, origin_y + padding_height / 2.0, "{half:?}");
+
+    let full = rect("full");
+    assert_eq!(full.x, origin_x + padding_width, "{full:?}");
+}
+
+#[test]
+fn fixed_calc_insets_resolve_against_the_viewport() {
+    let tree = parse_html(
+        r#"<style>
+            html, body { margin:0 }
+            #cb { position:relative; width:40px; height:30px; margin-left:100px }
+            #fixed { position:fixed; left:calc(100% - 10px); top:calc(50% + 2px);
+                     width:10px; height:10px }
+        </style>
+        <div id="cb"><div id="fixed"></div></div>"#,
+    );
+    let viewport = (400.0, 300.0);
+    let layout = layout_dom(&tree, viewport);
+    let fixed = layout.rects[&tree.get_element_by_id("fixed").unwrap()];
+    assert_eq!(fixed.x, viewport.0 - 10.0, "{fixed:?}");
+    assert_eq!(fixed.y, viewport.1 / 2.0 + 2.0, "{fixed:?}");
+}
+
+#[test]
+fn indefinite_column_flex_zero_basis_uses_content_before_max_height() {
+    let tree = parse_html(
+        r#"<style>html, body { margin:0 }</style>
+        <div id="container" style="display:flex; flex-direction:column; width:280px; max-height:300px">
+          <div id="header" style="height:24px">header</div>
+          <div id="body" style="flex:1; min-height:0; overflow-y:auto">
+            <div style="height:40px">a</div><div style="height:40px">b</div><div style="height:40px">c</div>
+          </div>
+        </div>"#,
+    );
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    let rect = |id: &str| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let container = rect("container");
+    let header = rect("header");
+    let body = rect("body");
+    assert_eq!(container.height, 144.0, "{container:?}");
+    assert_eq!(header.height, 24.0, "{header:?}");
+    assert_eq!(body.y, 24.0, "{body:?}");
+    assert_eq!(body.height, 120.0, "{body:?}");
+}
+
+#[test]
+fn absolute_calc_insets_use_the_real_shrink_to_fit_containing_block() {
+    // The top-down pass cannot know the shrink-to-fit width of the static
+    // absolute wrapper around #cb. Functional percentage insets must therefore
+    // stay deferred to Taffy, which resolves them against the final padding box
+    // of the real positioning containing block (#cb is 28px wide).
+    let tree = parse_html(
+        r#"<style>html, body { margin:0 }</style>
+        <div style="position:relative;width:1544px;height:555px">
+          <div style="position:absolute;left:7px;top:53px">
+            <div id="cb" style="position:relative">
+              <button style="width:28px;height:28px;display:block;padding:0;border:0"></button>
+              <div id="p" style="position:absolute;left:calc(100% + 4px);top:0;width:280px;height:170px"></div>
+              <div id="neg" style="position:absolute;left:calc(0% - 6px);top:0;width:10px;height:10px"></div>
+            </div>
+          </div>
+        </div>"#,
+    );
+    let layout = layout_dom(&tree, (1600.0, 900.0));
+    let rect = |id: &str| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let cb = rect("cb");
+    let p = rect("p");
+    assert_eq!(cb.width, 28.0, "{cb:?}");
+    assert_eq!(p.x, cb.x + 32.0, "{p:?} vs {cb:?}");
+    assert_eq!(rect("neg").x, cb.x - 6.0, "negative calc inset");
+}
+
+#[test]
+fn absolute_top_bottom_height_is_a_definite_percentage_basis() {
+    // CSS2 10.6.4: top+bottom on an absolutely positioned auto-height box
+    // produce a definite used height. `height:100%` descendants must resolve
+    // against it instead of collapsing to zero and clipping their content.
+    let tree = parse_html(
+        r#"<style>html, body { margin:0 }</style>
+        <div style="position:relative;width:1600px;height:900px">
+          <aside id="d" style="position:absolute;top:50px;bottom:0;left:0;width:56px">
+            <div id="c" style="width:100%;height:100%;overflow:auto">
+              <div id="inner" style="position:relative;width:100%;height:100%;overflow:hidden">
+                <div style="position:absolute;top:0;left:0;right:0">
+                  <div style="height:36px">item</div><div style="height:36px">item</div>
+                </div>
+              </div>
+            </div>
+          </aside>
+        </div>"#,
+    );
+    let layout = layout_dom(&tree, (1600.0, 900.0));
+    let rect = |id: &str| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let d = rect("d");
+    let c = rect("c");
+    let inner = rect("inner");
+    assert_eq!(d.y, 50.0, "{d:?}");
+    assert_eq!(d.height, 850.0, "{d:?}");
+    assert_eq!(c.height, 850.0, "{c:?}");
+    assert_eq!(inner.height, 850.0, "{inner:?}");
+}

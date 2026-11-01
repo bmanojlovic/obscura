@@ -16067,6 +16067,34 @@ globalThis.__ariaQuerySelector = function(root, selector) { return null; };
 globalThis.__ariaQuerySelectorAll = async function*(root, selector) { /* yields nothing */ };
 const _MAX_CANVAS_DIMENSION = 32767;
 const _MAX_CANVAS_PIXELS = 67108864;
+// Resolve a CanvasImageSource to straight-alpha RGBA pixels. HTMLImageElement
+// pixels come from the renderer cache the element's load already filled, and
+// are memoized on the element per selected resource.
+function _canvasImageSourcePixels(source) {
+  if (!source || typeof source !== 'object') return null;
+  if (source._ctx && source._ctx._buf) {
+    const ctx = source._ctx;
+    return { w: ctx._w, h: ctx._h, data: ctx._buf };
+  }
+  if (source._bitmapPixels) return source._closed ? null : source._bitmapPixels;
+  if (source instanceof HTMLImageElement) {
+    if (!source.complete || !source.naturalWidth) return null;
+    const key = source.currentSrc + '\0' + (source.getAttribute('crossorigin') ?? '');
+    if (source._canvasPixels && source._canvasPixels.key === key) return source._canvasPixels;
+    const op = __obscuraCore.ops.op_image_element_pixels;
+    if (typeof op !== 'function') return null;
+    const bytes = op(source._nid);
+    if (!bytes || bytes.length < 8) return null;
+    const view = new DataView(bytes.buffer, bytes.byteOffset, 8);
+    const w = view.getUint32(0, true), h = view.getUint32(4, true);
+    if (bytes.length !== 8 + w * h * 4) return null;
+    const pixels = { key, w, h,
+      data: new Uint8ClampedArray(bytes.buffer, bytes.byteOffset + 8, w * h * 4) };
+    source._canvasPixels = pixels;
+    return pixels;
+  }
+  return null;
+}
 class _Canvas2D {
   constructor(canvas) {
     this.canvas = canvas;
@@ -16258,19 +16286,62 @@ class _Canvas2D {
     this._markPaintDamage();
   }
   createImageData(w, h) { return { data: new Uint8ClampedArray(w*h*4), width: w, height: h }; }
-  drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh) {
-    if (img && img._ctx && img._ctx._buf) {
-      const src = img._ctx;
-      dx = dx ?? sx; dy = dy ?? sy; dw = dw ?? (sw ?? src._w); dh = dh ?? (sh ?? src._h);
-      for (let py = 0; py < dh; py++) {
-        for (let px = 0; px < dw; px++) {
-          const srcX = Math.floor((sx||0) + px * (sw||src._w) / dw);
-          const srcY = Math.floor((sy||0) + py * (sh||src._h) / dh);
-          if (srcX >= 0 && srcX < src._w && srcY >= 0 && srcY < src._h) {
-            const srcIdx = (srcY * src._w + srcX) * 4;
-            this._setPixel(dx+px, dy+py, src._buf[srcIdx], src._buf[srcIdx+1], src._buf[srcIdx+2], src._buf[srcIdx+3]);
-          }
+  drawImage(image, a, b, c, d, e, f, g, h) {
+    const src = _canvasImageSourcePixels(image);
+    if (!src || !src.w || !src.h) return;
+    let sx = 0, sy = 0, sw = src.w, sh = src.h, dx, dy, dw, dh;
+    if (arguments.length >= 9) { sx = +a; sy = +b; sw = +c; sh = +d; dx = +e; dy = +f; dw = +g; dh = +h; }
+    else if (arguments.length >= 5) { dx = +a; dy = +b; dw = +c; dh = +d; }
+    else { dx = +a; dy = +b; dw = src.w; dh = src.h; }
+    if (![sx, sy, sw, sh, dx, dy, dw, dh].every(Number.isFinite)) return;
+    if (sw < 0) { sx += sw; sw = -sw; }
+    if (sh < 0) { sy += sh; sh = -sh; }
+    if (dw < 0) { dx += dw; dw = -dw; }
+    if (dh < 0) { dy += dh; dh = -dh; }
+    if (!sw || !sh || !dw || !dh) return;
+    // Nearest-neighbour sample at destination pixel centres, clipped to both
+    // the source rectangle and the source bitmap.
+    const W = this._w, H = this._h, buf = this._buf, sbuf = src.data, SW = src.w;
+    const x0 = Math.max(0, Math.floor(dx)), x1 = Math.min(W, Math.ceil(dx + dw));
+    const y0 = Math.max(0, Math.floor(dy)), y1 = Math.min(H, Math.ceil(dy + dh));
+    if (x0 >= x1 || y0 >= y1) return;
+    const sxMin = Math.max(0, sx), sxMax = Math.min(src.w, sx + sw);
+    const syMin = Math.max(0, sy), syMax = Math.min(src.h, sy + sh);
+    const kx = sw / dw, ky = sh / dh;
+    const cols = new Int32Array(x1 - x0);
+    for (let x = x0; x < x1; x++) {
+      const col = Math.floor(sx + (x + 0.5 - dx) * kx);
+      cols[x - x0] = col >= sxMin && col < sxMax ? col : -1;
+    }
+    const ga = Math.min(1, Math.max(0, Number(this.globalAlpha)));
+    const plain = this.globalCompositeOperation === 'source-over' || !this.globalCompositeOperation;
+    for (let y = y0; y < y1; y++) {
+      const row = Math.floor(sy + (y + 0.5 - dy) * ky);
+      if (row < syMin || row >= syMax) continue;
+      const srow = row * SW;
+      let di = (y * W + x0) * 4;
+      for (let i = 0; i < cols.length; i++, di += 4) {
+        const col = cols[i];
+        if (col < 0) continue;
+        const si = (srow + col) * 4;
+        if (!plain) {
+          this._setPixel(x0 + i, y, sbuf[si], sbuf[si+1], sbuf[si+2], sbuf[si+3]);
+          continue;
         }
+        const sa = sbuf[si+3] * ga / 255;
+        if (sa <= 0) continue;
+        if (sa >= 1) {
+          buf[di] = sbuf[si]; buf[di+1] = sbuf[si+1]; buf[di+2] = sbuf[si+2]; buf[di+3] = 255;
+          continue;
+        }
+        // Straight-alpha source-over.
+        const da = buf[di+3] / 255;
+        const oa = sa + da * (1 - sa);
+        const dk = da * (1 - sa);
+        buf[di] = Math.round((sbuf[si] * sa + buf[di] * dk) / oa);
+        buf[di+1] = Math.round((sbuf[si+1] * sa + buf[di+1] * dk) / oa);
+        buf[di+2] = Math.round((sbuf[si+2] * sa + buf[di+2] * dk) / oa);
+        buf[di+3] = Math.round(oa * 255);
       }
     }
     this._markPaintDamage();
@@ -18090,8 +18161,66 @@ if (typeof Path2D === 'undefined') {
 }
 
 if (typeof ImageBitmap === 'undefined') {
-  globalThis.ImageBitmap = class ImageBitmap { constructor(){this.width=0;this.height=0;} close(){} };
-  globalThis.createImageBitmap = function() { return Promise.resolve(new ImageBitmap()); };
+  globalThis.ImageBitmap = class ImageBitmap {
+    constructor() { this._bitmapPixels = null; this._closed = false; }
+    get width() { return this._closed || !this._bitmapPixels ? 0 : this._bitmapPixels.w; }
+    get height() { return this._closed || !this._bitmapPixels ? 0 : this._bitmapPixels.h; }
+    close() { this._closed = true; this._bitmapPixels = null; }
+  };
+  const _bitmapFromPixels = (src, sx, sy, sw, sh) => {
+    const bitmap = new ImageBitmap();
+    if (sx === undefined) {
+      bitmap._bitmapPixels = { w: src.w, h: src.h, data: new Uint8ClampedArray(src.data) };
+      return bitmap;
+    }
+    sx = Math.trunc(sx); sy = Math.trunc(sy); sw = Math.trunc(sw); sh = Math.trunc(sh);
+    if (!sw || !sh) throw new RangeError("The crop rect width or height is 0.");
+    if (sw < 0) { sx += sw; sw = -sw; }
+    if (sh < 0) { sy += sh; sh = -sh; }
+    const data = new Uint8ClampedArray(sw * sh * 4);
+    for (let y = 0; y < sh; y++) {
+      const srcY = sy + y;
+      if (srcY < 0 || srcY >= src.h) continue;
+      for (let x = 0; x < sw; x++) {
+        const srcX = sx + x;
+        if (srcX < 0 || srcX >= src.w) continue;
+        const si = (srcY * src.w + srcX) * 4, di = (y * sw + x) * 4;
+        data[di] = src.data[si]; data[di+1] = src.data[si+1];
+        data[di+2] = src.data[si+2]; data[di+3] = src.data[si+3];
+      }
+    }
+    bitmap._bitmapPixels = { w: sw, h: sh, data };
+    return bitmap;
+  };
+  const _bitmapSource = async source => {
+    if (source instanceof HTMLImageElement) {
+      if (!source.complete) await source.decode();
+      return _canvasImageSourcePixels(source);
+    }
+    if (typeof ImageData !== 'undefined' && source instanceof ImageData) {
+      return { w: source.width, h: source.height, data: source.data };
+    }
+    if (typeof Blob !== 'undefined' && source instanceof Blob) {
+      const url = URL.createObjectURL(source);
+      try {
+        const img = new Image();
+        img.src = url;
+        await img.decode();
+        return _canvasImageSourcePixels(img);
+      } finally { URL.revokeObjectURL(url); }
+    }
+    return _canvasImageSourcePixels(source);
+  };
+  globalThis.createImageBitmap = async function createImageBitmap(source, sx, sy, sw, sh) {
+    if (arguments.length < 1) throw new TypeError("createImageBitmap requires 1 argument");
+    const pixels = await _bitmapSource(source);
+    if (!pixels || !pixels.w || !pixels.h) {
+      throw new DOMException("The source image could not be decoded.", "InvalidStateError");
+    }
+    return typeof sx === 'number' && arguments.length >= 5
+      ? _bitmapFromPixels(pixels, sx, sy, sw, sh)
+      : _bitmapFromPixels(pixels);
+  };
 }
 
 if (typeof Selection === 'undefined') {
@@ -18182,10 +18311,24 @@ if (typeof FontFace === 'undefined') {
     }
     return declarations;
   };
+  // Linked sheets keep their bytes in native state. Only origin-clean ones
+  // are readable here, matching what the CSSOM exposes for the same sheet.
+  const _fontFaceSheetText = node => {
+    let css = node.localName === 'style' ? (node.textContent || '') : '';
+    if (node.localName === 'link' && node.hasAttribute('disabled')) return css;
+    if (typeof __obscuraCore.ops.op_external_stylesheet_get !== 'function') return css;
+    try {
+      const loaded = JSON.parse(__obscuraCore.ops.op_external_stylesheet_get(
+        node._nid, globalThis.__obscura_frameId || 0
+      ));
+      if (loaded?.originClean === true && loaded.css) css = String(loaded.css) + '\n' + css;
+    } catch (_) {}
+    return css;
+  };
   const _fontFaceAuthoredRules = doc => {
     const out = [];
-    for (const style of doc.querySelectorAll('style')) {
-      const css = style.textContent || '';
+    for (const style of doc.querySelectorAll('style, link[rel~="stylesheet"]')) {
+      const css = _fontFaceSheetText(style);
       const pattern = /@font-face\s*\{([\s\S]*?)\}/gi;
       let match;
       while ((match = pattern.exec(css))) {

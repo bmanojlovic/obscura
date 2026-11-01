@@ -1422,6 +1422,16 @@ pub struct LayoutStyle {
     pub inset: [Option<Dimension>; 4], // top, right, bottom, left
     /// Deferred functional inset expressions in top/right/bottom/left order.
     pub inset_expressions: [Option<String>; 4],
+    /// Opaque calc handles for functional insets. Taffy resolves these against
+    /// the real containing block at layout time; pre-layout estimates cannot
+    /// know shrink-to-fit ancestor sizes. The Arc keeps every handle alive for
+    /// the lifetime of the layout tree.
+    pub(crate) inset_calc_expressions:
+        [Option<std::sync::Arc<crate::style::GridCalcExpression>>; 4],
+    /// Used top/right/bottom/left insets for an absolutely positioned box,
+    /// measured from its containing block after layout. CSSOM returns these
+    /// rather than page coordinates. `None` means the used inset is `auto`.
+    pub(crate) used_insets: [Option<f32>; 4],
 
     /// `overflow`/-x/-y other than `visible`: clips this element's descendants
     /// to its border box during paint. This is what makes the ubiquitous
@@ -2723,10 +2733,10 @@ pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
         s.position = pos;
         if !style.position_sticky {
             s.inset = taffy::Rect {
-                top: inset_lpa(style.inset[0]),
-                right: inset_lpa(style.inset[1]),
-                bottom: inset_lpa(style.inset[2]),
-                left: inset_lpa(style.inset[3]),
+                top: inset_lpa_with_calc(style, 0),
+                right: inset_lpa_with_calc(style, 1),
+                bottom: inset_lpa_with_calc(style, 2),
+                left: inset_lpa_with_calc(style, 3),
             };
         }
     }
@@ -2748,6 +2758,17 @@ pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
         s.border.bottom = taffy::LengthPercentage::length(0.0);
     }
     s
+}
+
+fn inset_lpa_with_calc(
+    style: &LayoutStyle,
+    index: usize,
+) -> taffy::style::LengthPercentageAuto {
+    if let Some(calc) = style.inset_calc_expressions[index].as_ref() {
+        let handle = std::sync::Arc::as_ptr(calc).cast::<()>();
+        return taffy::style::LengthPercentageAuto::calc(handle);
+    }
+    inset_lpa(style.inset[index])
 }
 
 fn inset_lpa(v: Option<Dimension>) -> taffy::style::LengthPercentageAuto {
