@@ -8,6 +8,14 @@
 # main -- this file only exists on the utility build branch.
 FROM rust:1-slim-bookworm
 
+# Keep C and CXX on the same toolchain. The Debian clang package points
+# /usr/bin/c++ at clang while /usr/bin/cc stays gcc, and the cc crate then
+# adds clang's --target only to CXX. BoringSSL detects clang from CXX and
+# passes clang-only warnings to gcc. Pin both to gcc to match the upstream
+# Ubuntu runners; libclang remains installed for bindgen.
+ENV CC=/usr/bin/gcc
+ENV CXX=/usr/bin/g++
+
 # Same stealth build dependencies the upstream release workflow installs.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
@@ -19,6 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libclang-dev \
         llvm-dev \
         git \
+        g++ \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -27,6 +36,7 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY vendor/ vendor/
 COPY crates/obscura-dom/Cargo.toml       crates/obscura-dom/Cargo.toml
+COPY crates/obscura-ssrf/Cargo.toml      crates/obscura-ssrf/Cargo.toml
 COPY crates/obscura-net/Cargo.toml       crates/obscura-net/Cargo.toml
 COPY crates/obscura-browser/Cargo.toml   crates/obscura-browser/Cargo.toml
 COPY crates/obscura-cdp/Cargo.toml       crates/obscura-cdp/Cargo.toml
@@ -37,7 +47,7 @@ COPY crates/obscura-cli/Cargo.toml       crates/obscura-cli/Cargo.toml
 COPY crates/obscura/Cargo.toml           crates/obscura/Cargo.toml
 
 # Create stub src files so cargo can resolve the dependency graph
-RUN for crate in obscura-dom obscura-net obscura-browser obscura-cdp obscura-js obscura-mcp obscura-render obscura; do \
+RUN for crate in obscura-dom obscura-ssrf obscura-net obscura-browser obscura-cdp obscura-js obscura-mcp obscura-render obscura; do \
         mkdir -p crates/$crate/src && echo "// stub" > crates/$crate/src/lib.rs; \
     done && \
     mkdir -p crates/obscura-cli/src && \
