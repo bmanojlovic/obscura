@@ -5326,6 +5326,13 @@ class Element extends Node {
         el._frameId = __obscuraCore.ops.op_frame_document_ready(
           loadedUrl, html, Math.round(box.width) || 300, Math.round(box.height) || 150, el._nid);
         if (el._frameId) globalThis.__obscura_frameElements[el._frameId] = el;
+        // Lets a later capture find this frame's own rendered document and
+        // composite it into el's box (same-origin or not -- pixel compositing
+        // is not the scripting access contentDocument denies).
+        if (el._frameId) {
+          const bind = __obscuraCore.ops.op_frame_bind_element;
+          if (typeof bind === 'function') bind(el._nid, el._frameId);
+        }
         el._iframeDoc = el._iframeOpaque ? null : new _IframeDocument(html, loadedUrl, el);
         el._iframeWin = el._iframeOpaque ? _remoteWindow(el._frameId) : new _IframeWindow(el._iframeDoc, loadedUrl);
         // Bind the window to the realm the host just queued. This is what makes
