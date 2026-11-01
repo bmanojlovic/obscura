@@ -1,0 +1,30 @@
+# Dev-only image for the build/local-testing integration branch (see
+# scripts/dev-build.sh). Layers real ticket-fix source on top of a base image
+# that already has dependencies compiled (Dockerfile.base), so only the fast
+# part -- the actual crates/ sources, which change on every ticket-fix commit
+# -- rebuilds here.
+#
+# Never used for the real release image (see Dockerfile) and never merged to
+# main -- this file only exists on the utility build branch.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE} AS builder
+
+WORKDIR /build
+ARG OBSCURA_VERSION
+
+# Copy real sources and build
+COPY crates/ crates/
+RUN echo "Building Obscura dev image version ${OBSCURA_VERSION:-unknown}" && \
+    touch crates/*/src/*.rs && cargo build --release --features render --bin obscura --bin obscura-worker
+
+# ---
+
+FROM gcr.io/distroless/cc-debian12:nonroot
+
+COPY --from=builder /build/target/release/obscura /obscura
+COPY --from=builder /build/target/release/obscura-worker /obscura-worker
+
+EXPOSE 9222
+
+ENTRYPOINT ["/obscura"]
+CMD ["serve", "--port", "9222", "--host", "0.0.0.0"]
