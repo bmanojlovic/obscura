@@ -4,6 +4,11 @@
 # part -- the actual crates/ sources, which change on every ticket-fix commit
 # -- rebuilds here.
 #
+# Builds the same four configurations as the upstream release workflow:
+# render, render+stealth, no-render, and no-render+stealth. /obscura is the
+# render+stealth superset so `--stealth` actually selects the wreq transport
+# instead of silently falling back to the non-stealth client.
+#
 # Never used for the real release image (see Dockerfile) and never merged to
 # main -- this file only exists on the utility build branch.
 ARG BASE_IMAGE
@@ -12,17 +17,38 @@ FROM ${BASE_IMAGE} AS builder
 WORKDIR /build
 ARG OBSCURA_VERSION
 
-# Copy real sources and build
+# Copy real sources and build every shipped configuration.
 COPY crates/ crates/
-RUN echo "Building Obscura dev image version ${OBSCURA_VERSION:-unknown}" && \
-    touch crates/*/src/*.rs && cargo build --release --features render --bin obscura --bin obscura-worker
+RUN set -eux; \
+    touch crates/*/src/*.rs; \
+    mkdir -p /build/dist; \
+    build() { \
+        variant="$1"; shift; \
+        echo "Building Obscura dev variant ${variant} (version ${OBSCURA_VERSION:-unknown})"; \
+        cargo build --release -p obscura-cli --bins "$@"; \
+        mkdir -p "/build/dist/${variant}"; \
+        cp target/release/obscura target/release/obscura-worker "/build/dist/${variant}/"; \
+    }; \
+    build render --features render; \
+    build stealth --features render,stealth; \
+    build no-render --no-default-features; \
+    build no-render-stealth --no-default-features --features stealth
 
 # ---
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 
-COPY --from=builder /build/target/release/obscura /obscura
-COPY --from=builder /build/target/release/obscura-worker /obscura-worker
+# render+stealth superset: the default entrypoint, so --stealth works.
+COPY --from=builder /build/dist/stealth/obscura /obscura
+COPY --from=builder /build/dist/stealth/obscura-worker /obscura-worker
+# render only, matching the upstream default release binary.
+COPY --from=builder /build/dist/render/obscura /obscura-render
+COPY --from=builder /build/dist/render/obscura-worker /obscura-worker-render
+# minimal variants.
+COPY --from=builder /build/dist/no-render/obscura /obscura-no-render
+COPY --from=builder /build/dist/no-render/obscura-worker /obscura-worker-no-render
+COPY --from=builder /build/dist/no-render-stealth/obscura /obscura-no-render-stealth
+COPY --from=builder /build/dist/no-render-stealth/obscura-worker /obscura-worker-no-render-stealth
 
 EXPOSE 9222
 

@@ -8,11 +8,16 @@
 # main -- this file only exists on the utility build branch.
 FROM rust:1-slim-bookworm
 
+# Same stealth build dependencies the upstream release workflow installs.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         ca-certificates \
         perl \
         make \
+        cmake \
+        clang \
+        libclang-dev \
+        llvm-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -38,4 +43,9 @@ RUN for crate in obscura-dom obscura-net obscura-browser obscura-cdp obscura-js 
     echo "fn main() {}" > crates/obscura-cli/src/main.rs && \
     echo "fn main() {}" > crates/obscura-cli/src/worker.rs
 
-RUN cargo build --release --features render --bin obscura --bin obscura-worker 2>/dev/null || true
+# Warm every configuration the upstream release workflow ships, so the dev
+# layer only rebuilds the obscura crates themselves.
+RUN cargo build --release -p obscura-cli --bins --features render 2>/dev/null || true
+RUN cargo build --release -p obscura-cli --bins --features render,stealth 2>/dev/null || true
+RUN cargo build --release -p obscura-cli --bins --no-default-features 2>/dev/null || true
+RUN cargo build --release -p obscura-cli --bins --no-default-features --features stealth 2>/dev/null || true
